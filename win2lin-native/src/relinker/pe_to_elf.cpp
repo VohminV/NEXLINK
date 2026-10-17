@@ -86,6 +86,29 @@ MissingFeatures check_cpu_features() {
 // ---------------------------------------------------------------------------
 // DLL -> shim .so mapping
 // ---------------------------------------------------------------------------
+// Folds CRT-family and api-set DLL names onto the shims that actually exist.
+// msvcrt/ucrtbase/vcruntime*/api-ms-win-crt-* all resolve to libwin_msvcrt.so
+// (one shared bootstrap surface); api-ms-win-core-* forwarders land in
+// libwin_kernel32.so. Returns the normalised, lowercased stem.
+std::string normalize_dll_stem(const std::string& stem) {
+    if (stem.rfind("api-ms-win-crt-", 0) == 0) return "msvcrt";
+    if (stem == "msvcrt" || stem == "msvcrt_os" || stem == "ucrtbase" ||
+        stem == "ucrtbase_app" || stem.rfind("vcruntime", 0) == 0 ||
+        stem.rfind("msvcr", 0) == 0 || stem.rfind("msvcp", 0) == 0) {
+        return "msvcrt";
+    }
+    if (stem.rfind("api-ms-win-core-", 0) == 0 || stem.rfind("api-ms-win-dev-", 0) == 0) {
+        return "kernel32";
+    }
+    return stem;
+}
+
+// True when the (lowercased, extension-free) DLL stem belongs to the CRT
+// family - i.e. the PE needs the msvcrt bootstrap path.
+bool is_crt_stem(const std::string& stem) {
+    return normalize_dll_stem(stem) == "msvcrt";
+}
+
 std::string dll_to_shim(const std::string& dll, const std::string& prefix,
                         const std::string& suffix) {
     std::string stem = dll;
@@ -95,6 +118,7 @@ std::string dll_to_shim(const std::string& dll, const std::string& prefix,
     for (char& c : stem) c = static_cast<char>(std::tolower((unsigned char)c));
     const auto dot = stem.find_last_of('.');
     if (dot != std::string::npos) stem = stem.substr(0, dot);
+    stem = normalize_dll_stem(stem);
     return prefix + stem + suffix;
 }
 
@@ -351,8 +375,10 @@ bool PeToElfConverter::parse_pe() {
 bool PeToElfConverter::rewrite_imports() {
     LOG_INFO("Rewriting imports: mapping Windows DLLs to native shims");
     std::map<std::string, ShimBinding> by_shim; // soname -> binding
+    crt_imports_ = false;
 
     for (const PeImportSlot& slot : imports_) {
+        if (is_crt_stem(dll_stem(slot.dll))) crt_imports_ = true;
         const std::string soname = dll_to_shim(slot.dll, opts_.shim_prefix,
                                                opts_.shim_suffix);
         ShimBinding& b = by_shim[soname];
@@ -506,6 +532,23 @@ bool PeToElfConverter::generate_elf() {
         glob_dats.push_back({imp.iat_rva, idx});
     }
 
+    // CRT bootstrap hook: when the PE imports CRT functions, the entry
+    // trampoline calls nexlink_crt_bootstrap() (exported by libwin_msvcrt.so)
+    // before entering the PE's own CRT startup. The call target is materialised
+    // by the dynamic linker through an R_X86_64_64 relocation into a
+    // `mov rax, imm64` immediate (an R_X86_64_PC32 direct call cannot reach
+    // from the PIE's low mapping ~0x55.. into the library region ~0x7f..
+    // - the displacement overflows the signed 32-bit field), so the trampoline
+    // segment must be writable (see the segment flags below).
+    const bool crt_boot = crt_imports_ && entry_rva_ != 0;
+    uint32_t crt_boot_sym = 0;
+    size_t crt_boot_rela_index = 0;
+    if (crt_boot) {
+        crt_boot_sym = intern_symbol("nexlink_crt_bootstrap");
+        LOG_INFO("CRT imports detected: routing PE entry through "
+                 "nexlink_crt_bootstrap");
+    }
+
     // ---- build dynamic string table ---------------------------------------
     // Layout: [0]=NUL, then shim sonames, runpath, then symbol names. Offsets
     // recorded so DT_NEEDED / st_name can reference them.
@@ -548,6 +591,14 @@ bool PeToElfConverter::generate_elf() {
     }
     for (const GlobDat& g : glob_dats) {
         relas.push_back({base + g.rva, ELF64_R_INFO(g.sym, R_X86_64_GLOB_DAT), 0});
+    }
+    if (crt_boot) {
+        // Placeholder: r_offset is patched once tramp_rva is known. The entry
+        // must exist now so .rela.dyn's size (and thus the metadata layout)
+        // already accounts for it. R_X86_64_64 (absolute) because the target
+        // lives in another DSO, too far for a 32-bit PC-relative displacement.
+        crt_boot_rela_index = relas.size();
+        relas.push_back({0, ELF64_R_INFO(crt_boot_sym, R_X86_64_64), 0});
     }
 
     // ---- lay out the metadata block ---------------------------------------
@@ -592,12 +643,26 @@ bool PeToElfConverter::generate_elf() {
     // shims) spill SSE registers with `movaps` to a misaligned address ->
     // SIGSEGV. This trampoline re-establishes the expected alignment via a
     // `call` (which pushes a return address) and provides a clean exit stub in
-    // case the PE entry ever returns.
+    // case the PE entry ever returns. When the PE imports the CRT, the
+    // trampoline additionally calls nexlink_crt_bootstrap() (relocated by
+    // ld.so) so heap/stdio/argv are ready before mainCRTStartup runs.
     const uint64_t tramp_rva = align_up(meta.base_rva + meta.total_size, PAGE);
     std::vector<uint8_t> tramp;
-    tramp.reserve(32);
+    tramp.reserve(48);
     // and rsp, -16
     tramp.insert(tramp.end(), {0x48, 0x83, 0xe4, 0xf0});
+    // mov rax, imm64; call rax  -- nexlink_crt_bootstrap (imm64 patched by
+    // ld.so via R_X86_64_64; call rax works across the full 64-bit range,
+    // unlike a rel32 call into another DSO).
+    if (crt_boot) {
+        tramp.push_back(0x48);
+        tramp.push_back(0xB8);
+        const uint64_t imm_off = tramp.size();
+        tramp.insert(tramp.end(), 8, 0);
+        tramp.push_back(0xFF);
+        tramp.push_back(0xD0);
+        relas[crt_boot_rela_index].offset = base + tramp_rva + imm_off;
+    }
     // call rel32 (target = PE entry RVA)
     {
         const uint64_t call_end = tramp_rva + tramp.size() + 5;
@@ -762,11 +827,12 @@ bool PeToElfConverter::generate_elf() {
         s.align = PAGE;
         phdrs.push_back(s);
     }
-    // Entry trampoline LOAD (executable)
+    // Entry trampoline LOAD (executable). Writable when it carries the CRT
+    // bootstrap call: ld.so patches the call displacement in place.
     {
         Segment s;
         s.type = PT_LOAD;
-        s.flags = PF_R | PF_X;
+        s.flags = PF_R | PF_X | (crt_boot ? PF_W : 0);
         s.offset = tramp_rva;
         s.vaddr = base + tramp_rva;
         s.filesz = tramp.size();

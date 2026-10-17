@@ -30,6 +30,8 @@ using BOOL = int32_t;
 using BYTE = uint8_t;
 using WORD = uint16_t;
 using DWORD = uint32_t;
+using ATOM = uint16_t;
+using HRESULT = int32_t;
 using QWORD = uint64_t;
 using LONG = int32_t;
 using ULONG = uint32_t;
@@ -45,13 +47,98 @@ using HINSTANCE = void*;
 using HWND = void*;
 using HDC = void*;
 using HGLRC = void*;
+using HICON = void*;
+using HCURSOR = void*;
+using HBRUSH = void*;
+using HMENU = void*;
 using LPVOID = void*;
 using LPCVOID = const void*;
+using PVOID = void*;
 using LPSTR = char*;
 using LPCSTR = const char*;
 using LPWSTR = WCHAR*;
 using LPCWSTR = const WCHAR*;
 using LPDWORD = DWORD*;
+using LPBYTE = BYTE*;
+
+using WPARAM = uint64_t;
+using LPARAM = int64_t;
+using LRESULT = int64_t;
+using UINT_PTR = uint64_t;
+using INT_PTR = int64_t;
+using LONG_PTR = int64_t;
+using ULONG_PTR = uint64_t;
+using DWORD_PTR = uint64_t;
+
+struct POINT {
+    LONG x;
+    LONG y;
+};
+
+struct RECT {
+    LONG left;
+    LONG top;
+    LONG right;
+    LONG bottom;
+};
+
+struct MSG {
+    HWND hwnd;
+    UINT message;
+    WPARAM wParam;
+    LPARAM lParam;
+    DWORD time;
+    POINT pt;
+};
+
+using WNDPROC = LRESULT(WINAPI*)(HWND, UINT, WPARAM, LPARAM);
+
+struct WNDCLASSEXW {
+    UINT cbSize;
+    UINT style;
+    WNDPROC lpfnWndProc;
+    int cbClsExtra;
+    int cbWndExtra;
+    HINSTANCE hInstance;
+    HICON hIcon;
+    HCURSOR hCursor;
+    HBRUSH hbrBackground;
+    LPCWSTR lpszMenuName;
+    LPCWSTR lpszClassName;
+    HICON hIconSm;
+};
+
+struct STARTUPINFOW {
+    DWORD cb;
+    LPWSTR lpReserved;
+    LPWSTR lpDesktop;
+    LPWSTR lpTitle;
+    DWORD dwX;
+    DWORD dwY;
+    DWORD dwXSize;
+    DWORD dwYSize;
+    DWORD dwXCountChars;
+    DWORD dwYCountChars;
+    DWORD dwFillAttribute;
+    DWORD dwFlags;
+    WORD wShowWindow;
+    WORD cbReserved2;
+    LPBYTE lpReserved2;
+    HANDLE hStdInput;
+    HANDLE hStdOutput;
+    HANDLE hStdError;
+};
+
+struct MEMORY_BASIC_INFORMATION {
+    PVOID BaseAddress;
+    PVOID AllocationBase;
+    DWORD AllocationProtect;
+    WORD PartitionId;
+    SIZE_T RegionSize;
+    DWORD State;
+    DWORD Protect;
+    DWORD Type;
+};
 
 using THREAD_START_ROUTINE = DWORD(WINAPI*)(LPVOID);
 

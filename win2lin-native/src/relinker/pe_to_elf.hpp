@@ -78,6 +78,10 @@ private:
     std::vector<PeImportSlot> imports_;
     std::vector<PeBaseReloc> base_relocs_;
     bool has_relocs_ = false;
+    // Set by rewrite_imports() when any imported DLL belongs to the CRT
+    // family (msvcrt/ucrtbase/vcruntime*/api-ms-win-crt-*). The entry
+    // trampoline then calls nexlink_crt_bootstrap() before the PE entry.
+    bool crt_imports_ = false;
 };
 
 } // namespace win2lin::relinker

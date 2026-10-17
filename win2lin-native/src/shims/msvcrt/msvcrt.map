@@ -1,0 +1,20 @@
+/* Version script for libwin_msvcrt.so.
+ *
+ * Every export is tagged with the NEXLINK_1_0 version. Two properties make
+ * this the fix for cross-library symbol interposition:
+ *
+ *   * The relinked PE references are UNVERSIONED, so they match the first
+ *     definition found in the global scope - libwin_msvcrt.so's exports.
+ *   * Other libraries in the process (libstdc++, libgcc, libc consumers such
+ *     as libwin_user32.so) reference malloc/strlen/memcpy... with GLIBC_2.x
+ *     version requirements. A definition carrying a *different* version does
+ *     NOT satisfy those references, so the loader skips our ms_abi exports
+ *     and binds the real SysV glibc functions instead. Without this, a
+ *     SysV-ABI caller inside libstdc++ would pass arguments in rdi/rsi/rdx
+ *     while our WINAPI (ms_abi) exports read rcx/rdx/r8 - corrupting the
+ *     heap and crashing.
+ */
+NEXLINK_1_0 {
+    global:
+        *;
+};

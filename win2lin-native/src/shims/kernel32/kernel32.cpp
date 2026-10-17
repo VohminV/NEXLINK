@@ -52,7 +52,9 @@ namespace {
 // Error state. GetLastError() is per-thread on Windows, so mirror that with
 // a thread_local. Every shim entry point that can fail calls set_last_error().
 // --------------------------------------------------------------------------
-thread_local DWORD t_last_error = ERROR_SUCCESS;
+// initial-exec TLS: avoids __tls_get_addr (a SysV call that clobbers RDI/RSI,
+// which are callee-saved under the ms_abi our callers use).
+thread_local DWORD t_last_error __attribute__((tls_model("initial-exec"))) = ERROR_SUCCESS;
 
 void set_last_error(DWORD e) { t_last_error = e; }
 
@@ -174,6 +176,48 @@ std::u16string latin1_to_utf16(const char* s) {
     return w;
 }
 
+// --------------------------------------------------------------------------
+// DLL stem -> shim stem aliasing. The relinker applies the same mapping at
+// static-link time; runtime LoadLibrary/GetModuleHandle must agree so
+// delay-loaded CRT/api-set DLLs resolve to the shims that actually exist.
+// --------------------------------------------------------------------------
+std::string shim_stem_for_dll(std::string stem) {
+    for (char& c : stem) c = static_cast<char>(tolower((unsigned char)c));
+    // Universal CRT + vcruntime + MSVC C++ runtime all fold into the one
+    // msvcrt shim (Phase 1.5 covers the shared bootstrap surface).
+    if (stem == "msvcrt" || stem == "msvcrt_os" || stem == "ucrtbase" ||
+        stem == "ucrtbase_app" || stem.rfind("vcruntime", 0) == 0 ||
+        stem.rfind("msvcr", 0) == 0 || stem.rfind("msvcp", 0) == 0 ||
+        stem.rfind("api-ms-win-crt-", 0) == 0) {
+        return "msvcrt";
+    }
+    // api-set forwarders for core Win32 APIs land in kernel32.
+    if (stem.rfind("api-ms-win-core-", 0) == 0 || stem.rfind("api-ms-win-dev-", 0) == 0) {
+        return "kernel32";
+    }
+    return stem;
+}
+
+// Splits "path\foo.dll" -> lowercased stem, strips directories and extension.
+std::string dll_stem_of(LPCSTR name) {
+    std::string n(name ? name : "");
+    for (char& c : n) c = static_cast<char>(tolower((unsigned char)c));
+    const auto slash = n.find_last_of("/\\");
+    if (slash != std::string::npos) n = n.substr(slash + 1);
+    const auto dot = n.find_last_of('.');
+    return (dot == std::string::npos) ? n : n.substr(0, dot);
+}
+
+// dlopen shim for a Windows DLL name with aliasing; nullptr on failure.
+void* dlopen_shim_for_dll(LPCSTR name) {
+    if (!name) return nullptr;
+    const std::string stem = shim_stem_for_dll(dll_stem_of(name));
+    const std::string soname = "libwin_" + stem + ".so";
+    void* h = dlopen(soname.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!h) h = dlopen(dll_stem_of(name).c_str(), RTLD_NOW | RTLD_GLOBAL);
+    return h;
+}
+
 } // namespace
 
 // ==========================================================================
@@ -207,25 +251,22 @@ WIN2LIN_EXPORT HMODULE WINAPI GetModuleHandleA(LPCSTR name) {
     // Main image or an already-mapped shim. dlopen(nullptr) hands back the
     // main program handle, which GetProcAddress can query via dlsym.
     if (!name) return dlopen(nullptr, RTLD_NOW);
+    // Games commonly do GetModuleHandleW(L"user32.dll") + GetProcAddress to
+    // resolve APIs dynamically; map the Windows name onto our shim soname.
+    if (void* h = dlopen_shim_for_dll(name)) return h;
     return dlopen(name, RTLD_NOW);
 }
 WIN2LIN_EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
     if (!name) return dlopen(nullptr, RTLD_NOW);
-    return dlopen(utf16_to_utf8(name).c_str(), RTLD_NOW);
+    return GetModuleHandleA(utf16_to_utf8(name).c_str());
 }
 
 WIN2LIN_EXPORT HMODULE WINAPI LoadLibraryA(LPCSTR name) {
     if (!name) { set_last_error(ERROR_INVALID_PARAMETER); return nullptr; }
-    // Map foo.dll -> libwin_foo.so. Delay-loaded imports call this at runtime.
-    std::string n(name);
-    for (char& c : n) c = static_cast<char>(tolower((unsigned char)c));
-    const auto slash = n.find_last_of("/\\");
-    if (slash != std::string::npos) n = n.substr(slash + 1);
-    const auto dot = n.find_last_of('.');
-    std::string stem = (dot == std::string::npos) ? n : n.substr(0, dot);
-    std::string soname = "libwin_" + stem + ".so";
-    void* h = dlopen(soname.c_str(), RTLD_NOW | RTLD_GLOBAL);
-    if (!h) h = dlopen(n.c_str(), RTLD_NOW | RTLD_GLOBAL); // fall back to raw name
+    // Map foo.dll -> libwin_foo.so (with CRT/api-set aliasing). Delay-loaded
+    // imports call this at runtime.
+    void* h = dlopen_shim_for_dll(name);
+    if (!h) h = dlopen(dll_stem_of(name).c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!h) { set_last_error(ERROR_FILE_NOT_FOUND); return nullptr; }
     return h;
 }
@@ -252,6 +293,32 @@ WIN2LIN_EXPORT BOOL WINAPI FreeLibrary(HMODULE) {
 }
 
 WIN2LIN_EXPORT BOOL WINAPI IsDebuggerPresent(void) { return 0; }
+
+using LPTOP_LEVEL_EXCEPTION_FILTER = LONG(WINAPI*)(void*);
+WIN2LIN_EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(
+    LPTOP_LEVEL_EXCEPTION_FILTER filter) {
+    static LPTOP_LEVEL_EXCEPTION_FILTER t_previous = nullptr;
+    LPTOP_LEVEL_EXCEPTION_FILTER old = t_previous;
+    t_previous = filter;
+    return old;
+}
+
+WIN2LIN_EXPORT void WINAPI GetStartupInfoW(STARTUPINFOW* si) {
+    if (!si) return;
+    std::memset(si, 0, sizeof(*si));
+    si->cb = sizeof(STARTUPINFOW);
+    si->wShowWindow = 1; // SW_SHOWNORMAL
+    si->hStdInput = reinterpret_cast<HANDLE>(static_cast<intptr_t>(0));
+    si->hStdOutput = reinterpret_cast<HANDLE>(static_cast<intptr_t>(1));
+    si->hStdError = reinterpret_cast<HANDLE>(static_cast<intptr_t>(2));
+}
+
+WIN2LIN_EXPORT void WINAPI GetStartupInfoA(STARTUPINFOW* si) {
+    // STARTUPINFOA and STARTUPINFOW are layout-identical on x64 (pointers are
+    // the same width); fill once and let the caller interpret the strings.
+    GetStartupInfoW(si);
+}
+
 WIN2LIN_EXPORT void WINAPI OutputDebugStringA(LPCSTR s) {
     if (s) fprintf(stderr, "[win2lin:debug] %s", s);
 }
@@ -333,6 +400,69 @@ WIN2LIN_EXPORT BOOL WINAPI VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
         }
     }
     return 1;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI VirtualProtect(LPVOID addr, SIZE_T size, DWORD new_protect,
+                                          DWORD* old_protect) {
+    if (!addr || size == 0) { set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    // Report the previous protection as the most permissive plausible value:
+    // PE code (e.g. CRT relocations, JIT-style patching) only checks that the
+    // call succeeds and usually restores via the returned value.
+    if (old_protect) *old_protect = PAGE_EXECUTE_READWRITE;
+
+    const uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~uintptr_t(0xFFF);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + 0xFFF) & ~uintptr_t(0xFFF);
+    if (mprotect(reinterpret_cast<void*>(page), end - page, prot_from_win(new_protect)) != 0) {
+        set_last_error(errno_to_win(errno));
+        return 0;
+    }
+    return 1;
+}
+
+WIN2LIN_EXPORT SIZE_T WINAPI VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION* mbi,
+                                          SIZE_T len) {
+    if (!addr || !mbi || len < sizeof(MEMORY_BASIC_INFORMATION)) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // Locate the mapping that owns `addr` via /proc/self/maps.
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t region_lo = target & ~uintptr_t(0xFFF);
+    uintptr_t region_hi = region_lo + 0x1000;
+    DWORD protect = PAGE_READONLY;
+    bool found = false;
+
+    FILE* f = std::fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), f)) {
+            unsigned long long lo = 0, hi = 0;
+            char perms[8] = {};
+            if (std::sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+            if (target >= lo && target < hi) {
+                region_lo = target & ~uintptr_t(0xFFF);
+                region_hi = static_cast<uintptr_t>(hi);
+                protect = PAGE_NOACCESS;
+                if (perms[0] == 'r') protect = PAGE_READONLY;
+                if (perms[1] == 'w') protect = PAGE_READWRITE;
+                if (perms[2] == 'x') protect = PAGE_EXECUTE_READWRITE;
+                found = true;
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    if (!found) { set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+
+    std::memset(mbi, 0, sizeof(*mbi));
+    mbi->BaseAddress = reinterpret_cast<PVOID>(region_lo);
+    mbi->AllocationBase = reinterpret_cast<PVOID>(region_lo);
+    mbi->AllocationProtect = protect;
+    mbi->RegionSize = region_hi - region_lo;
+    mbi->State = MEM_COMMIT;
+    mbi->Protect = protect;
+    mbi->Type = MEM_PRIVATE;
+    return sizeof(MEMORY_BASIC_INFORMATION);
 }
 
 WIN2LIN_EXPORT HANDLE WINAPI GetProcessHeap(void) {
@@ -461,6 +591,280 @@ WIN2LIN_EXPORT void WINAPI Sleep(DWORD ms) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, nullptr);
+}
+
+// ==========================================================================
+// Thread Local Storage (dynamic TlsAlloc slots) + critical sections
+// ==========================================================================
+namespace {
+constexpr DWORD MAX_TLS_SLOTS = 1088; // Windows Server 2003+ dynamic TLS limit
+constexpr DWORD TLS_OUT_OF_INDEXES = 0xFFFFFFFF;
+
+std::mutex g_tls_alloc_mutex;
+bool g_tls_slot_used[MAX_TLS_SLOTS] = {};
+// Per-thread value cells; slot allocation itself is process-wide.
+// initial-exec TLS: avoids __tls_get_addr (clobbers RDI/RSI under ms_abi).
+thread_local void* t_tls_values[MAX_TLS_SLOTS] __attribute__((tls_model("initial-exec"))) = {};
+
+// CRITICAL_SECTION emulation: the PE owns the (opaque) struct memory; we map
+// each initialized struct address to a pthread mutex held by the shim.
+std::mutex g_cs_registry_mutex;
+std::map<void*, pthread_mutex_t*> g_cs_registry;
+} // namespace
+
+WIN2LIN_EXPORT DWORD WINAPI TlsAlloc(void) {
+    std::lock_guard<std::mutex> lk(g_tls_alloc_mutex);
+    for (DWORD i = 0; i < MAX_TLS_SLOTS; ++i) {
+        if (!g_tls_slot_used[i]) {
+            g_tls_slot_used[i] = true;
+            t_tls_values[i] = nullptr;
+            return i;
+        }
+    }
+    set_last_error(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
+    return TLS_OUT_OF_INDEXES;
+}
+
+WIN2LIN_EXPORT LPVOID WINAPI TlsGetValue(DWORD index) {
+    if (index >= MAX_TLS_SLOTS) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    t_last_error = ERROR_SUCCESS;
+    return t_tls_values[index];
+}
+
+WIN2LIN_EXPORT BOOL WINAPI TlsSetValue(DWORD index, LPVOID value) {
+    if (index >= MAX_TLS_SLOTS) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    t_tls_values[index] = value;
+    return 1;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI TlsFree(DWORD index) {
+    std::lock_guard<std::mutex> lk(g_tls_alloc_mutex);
+    if (index >= MAX_TLS_SLOTS || !g_tls_slot_used[index]) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    g_tls_slot_used[index] = false;
+    return 1;
+}
+
+WIN2LIN_EXPORT void WINAPI InitializeCriticalSection(void* cs) {
+    if (!cs) return;
+    auto* m = new pthread_mutex_t;
+    pthread_mutex_init(m, nullptr);
+    std::lock_guard<std::mutex> lk(g_cs_registry_mutex);
+    g_cs_registry[cs] = m;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI InitializeCriticalSectionAndSpinCount(void* cs, DWORD) {
+    InitializeCriticalSection(cs);
+    return 1;
+}
+
+WIN2LIN_EXPORT void WINAPI EnterCriticalSection(void* cs) {
+    pthread_mutex_t* m = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_cs_registry_mutex);
+        auto it = g_cs_registry.find(cs);
+        if (it != g_cs_registry.end()) m = it->second;
+    }
+    if (m) pthread_mutex_lock(m); // unknown CS: treat as uncontended no-op
+}
+
+WIN2LIN_EXPORT BOOL WINAPI TryEnterCriticalSection(void* cs) {
+    pthread_mutex_t* m = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_cs_registry_mutex);
+        auto it = g_cs_registry.find(cs);
+        if (it != g_cs_registry.end()) m = it->second;
+    }
+    if (!m) return 1;
+    return pthread_mutex_trylock(m) == 0 ? 1 : 0;
+}
+
+WIN2LIN_EXPORT void WINAPI LeaveCriticalSection(void* cs) {
+    pthread_mutex_t* m = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_cs_registry_mutex);
+        auto it = g_cs_registry.find(cs);
+        if (it != g_cs_registry.end()) m = it->second;
+    }
+    if (m) pthread_mutex_unlock(m);
+}
+
+WIN2LIN_EXPORT void WINAPI DeleteCriticalSection(void* cs) {
+    pthread_mutex_t* m = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_cs_registry_mutex);
+        auto it = g_cs_registry.find(cs);
+        if (it != g_cs_registry.end()) {
+            m = it->second;
+            g_cs_registry.erase(it);
+        }
+    }
+    if (m) {
+        pthread_mutex_destroy(m);
+        delete m;
+    }
+}
+
+// ==========================================================================
+// Character set conversion (Phase 1.5: UTF-8 assumed for ACP)
+// ==========================================================================
+WIN2LIN_EXPORT int WINAPI IsDBCSLeadByteEx(UINT code_page, BYTE) {
+    // UTF-8 (our ACP stand-in) has no single-byte lead bytes in the SBCS
+    // sense; DBCS-era code pages are not modelled yet.
+    (void)code_page;
+    return 0;
+}
+
+namespace {
+// Decodes one UTF-8 sequence; advances *i. Returns U+FFFD on malformed input.
+uint32_t utf8_next(const char* s, size_t len, size_t* i) {
+    const auto b = [&](size_t k) -> unsigned char {
+        return (*i + k < len) ? static_cast<unsigned char>(s[*i + k]) : 0;
+    };
+    const unsigned char c = b(0);
+    if (c < 0x80) { ++*i; return c; }
+    if ((c & 0xE0) == 0xC0 && (b(1) & 0xC0) == 0x80) {
+        *i += 2;
+        return ((c & 0x1Fu) << 6) | (b(1) & 0x3Fu);
+    }
+    if ((c & 0xF0) == 0xE0 && (b(1) & 0xC0) == 0x80 && (b(2) & 0xC0) == 0x80) {
+        *i += 3;
+        return ((c & 0x0Fu) << 12) | ((b(1) & 0x3Fu) << 6) | (b(2) & 0x3Fu);
+    }
+    if ((c & 0xF8) == 0xF0 && (b(1) & 0xC0) == 0x80 && (b(2) & 0xC0) == 0x80 &&
+        (b(3) & 0xC0) == 0x80) {
+        *i += 4;
+        return ((c & 0x07u) << 18) | ((b(1) & 0x3Fu) << 12) | ((b(2) & 0x3Fu) << 6) |
+               (b(3) & 0x3Fu);
+    }
+    ++*i;
+    return 0xFFFD;
+}
+} // namespace
+
+WIN2LIN_EXPORT int WINAPI MultiByteToWideChar(UINT code_page, DWORD, LPCSTR src,
+                                              int src_len, LPWSTR dst, int dst_len) {
+    if (!src || src_len == 0) return 0;
+    const bool utf8 = (code_page == 65001 || code_page == 0 || code_page == 3 ||
+                       code_page == 65000);
+    const size_t in_len = (src_len < 0) ? std::strlen(src) : static_cast<size_t>(src_len);
+
+    size_t needed = 0;
+    size_t i = 0;
+    while (i < in_len) {
+        uint32_t cp;
+        if (utf8) {
+            cp = utf8_next(src, in_len, &i);
+        } else {
+            cp = static_cast<unsigned char>(src[i++]); // SBCS stand-in
+        }
+        needed += (cp >= 0x10000) ? 2 : 1;
+    }
+    if (!dst || dst_len == 0) return static_cast<int>(needed);
+    if (static_cast<size_t>(dst_len) < needed) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    size_t out = 0;
+    i = 0;
+    while (i < in_len) {
+        uint32_t cp;
+        if (utf8) {
+            cp = utf8_next(src, in_len, &i);
+        } else {
+            cp = static_cast<unsigned char>(src[i++]);
+        }
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            dst[out++] = static_cast<WCHAR>(0xD800 + (cp >> 10));
+            dst[out++] = static_cast<WCHAR>(0xDC00 + (cp & 0x3FF));
+        } else {
+            dst[out++] = static_cast<WCHAR>(cp);
+        }
+    }
+    return static_cast<int>(out);
+}
+
+WIN2LIN_EXPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD, LPCWSTR src,
+                                              int src_len, LPSTR dst, int dst_len,
+                                              LPCSTR default_char, BOOL* used_default) {
+    if (used_default) *used_default = 0;
+    if (!src || src_len == 0) return 0;
+    const bool utf8 = (code_page == 65001 || code_page == 0 || code_page == 3 ||
+                       code_page == 65000);
+    size_t in_len;
+    if (src_len < 0) {
+        in_len = 0;
+        while (src[in_len]) ++in_len; // src is WCHAR* (char16_t), not wchar_t
+    } else {
+        in_len = static_cast<size_t>(src_len);
+    }
+
+    size_t needed = 0;
+    for (size_t i = 0; i < in_len;) {
+        uint32_t cp = src[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < in_len && src[i + 1] >= 0xDC00 &&
+            src[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (src[i + 1] - 0xDC00);
+            ++i;
+        }
+        ++i;
+        if (!utf8) {
+            needed += 1;
+        } else if (cp < 0x80) {
+            needed += 1;
+        } else if (cp < 0x800) {
+            needed += 2;
+        } else if (cp < 0x10000) {
+            needed += 3;
+        } else {
+            needed += 4;
+        }
+    }
+    if (!dst || dst_len == 0) return static_cast<int>(needed);
+    if (static_cast<size_t>(dst_len) < needed) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; i < in_len;) {
+        uint32_t cp = src[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < in_len && src[i + 1] >= 0xDC00 &&
+            src[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (src[i + 1] - 0xDC00);
+            ++i;
+        }
+        ++i;
+        if (!utf8) {
+            dst[out++] = static_cast<char>(cp < 0x100 ? cp
+                                                      : (default_char ? *default_char : '?'));
+        } else if (cp < 0x80) {
+            dst[out++] = static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            dst[out++] = static_cast<char>(0xC0 | (cp >> 6));
+            dst[out++] = static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            dst[out++] = static_cast<char>(0xE0 | (cp >> 12));
+            dst[out++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            dst[out++] = static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            dst[out++] = static_cast<char>(0xF0 | (cp >> 18));
+            dst[out++] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            dst[out++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            dst[out++] = static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    return static_cast<int>(out);
 }
 
 // ==========================================================================
