@@ -1,0 +1,41 @@
+# ---- Build output ----
+build/
+cmake-build-*/
+*.o
+*.obj
+*.lo
+*.a
+*.la
+*.so
+*.so.*
+*.dylib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+
+# ---- Generated binaries (keep sources!) ----
+*.elf
+
+# ---- Upscaler model weights & caches (large; downloaded separately) ----
+models/*.onnx
+models/*.param
+models/*.bin
+models/*.weights
+*.ckpt
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*~
+.cache/
+.clangd/
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
