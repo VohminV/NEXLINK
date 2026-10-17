@@ -66,6 +66,7 @@ using Sighandler = void(WINAPI*)(int);
 // ---------------------------------------------------------------------------
 // Resolved glibc entry points (SysV ABI - our TU's native convention).
 // ---------------------------------------------------------------------------
+// <time.h> is pulled in transitively by system headers; use its struct tm.
 struct GlibcFns {
     void* (*malloc)(size_t);
     void* (*calloc)(size_t, size_t);
@@ -79,6 +80,7 @@ struct GlibcFns {
     void* (*memmove)(void*, const void*, size_t);
     void* (*memset)(void*, int, size_t);
     int (*memcmp)(const void*, const void*, size_t);
+    void* (*memchr)(const void*, int, size_t);
     char* (*strcpy)(char*, const char*);
     char* (*strcat)(char*, const char*);
     char* (*strchr)(const char*, int);
@@ -102,6 +104,26 @@ struct GlibcFns {
     int (*putchar)(int);
     int (*puts)(const char*);
     void* (*fopen)(const char*, const char*);
+    char* (*getenv)(const char*);
+    unsigned long (*strtoul)(const char*, char**, int);
+    int (*setlocale)(int, const char*);
+    int (*setvbuf)(void*, char*, int, size_t);
+    int (*fileno)(void*);
+    void* (*fdopen)(int, const char*);
+    long long (*lseek)(int, long long, int);
+    long long (*lseek64)(int, long long, int);
+    int (*read)(int, void*, size_t);
+    int (*write)(int, const void*, size_t);
+    int (*fstat64)(int, void*);
+    int (*iswctype)(unsigned, unsigned);
+    unsigned (*towlower)(unsigned);
+    unsigned (*towupper)(unsigned);
+    int (*strcoll)(const char*, const char*);
+    size_t (*strxfrm)(char*, const char*, size_t);
+    size_t (*strftime)(char*, size_t, const char*, const struct tm*);
+    size_t (*wcscoll)(const wchar_t*, const wchar_t*);
+    size_t (*wcsxfrm)(wchar_t*, const wchar_t*, size_t);
+    size_t (*wcsftime)(wchar_t*, size_t, const wchar_t*, const struct tm*);
     // std stream objects (glibc FILE* values, obtained from data symbols).
     void* stdin_g;
     void* stdout_g;
@@ -126,6 +148,27 @@ void resolve_glibc() {
     g_glibc.memmove = reinterpret_cast<decltype(g_glibc.memmove)>(sym("memmove"));
     g_glibc.memset = reinterpret_cast<decltype(g_glibc.memset)>(sym("memset"));
     g_glibc.memcmp = reinterpret_cast<decltype(g_glibc.memcmp)>(sym("memcmp"));
+    g_glibc.memchr = reinterpret_cast<decltype(g_glibc.memchr)>(sym("memchr"));
+    g_glibc.getenv = reinterpret_cast<decltype(g_glibc.getenv)>(sym("getenv"));
+    g_glibc.strtoul = reinterpret_cast<decltype(g_glibc.strtoul)>(sym("strtoul"));
+    g_glibc.setlocale = reinterpret_cast<decltype(g_glibc.setlocale)>(sym("setlocale"));
+    g_glibc.setvbuf = reinterpret_cast<decltype(g_glibc.setvbuf)>(sym("setvbuf"));
+    g_glibc.fileno = reinterpret_cast<decltype(g_glibc.fileno)>(sym("fileno"));
+    g_glibc.fdopen = reinterpret_cast<decltype(g_glibc.fdopen)>(sym("fdopen"));
+    g_glibc.lseek = reinterpret_cast<decltype(g_glibc.lseek)>(sym("lseek"));
+    g_glibc.lseek64 = reinterpret_cast<decltype(g_glibc.lseek64)>(sym("lseek64"));
+    g_glibc.read = reinterpret_cast<decltype(g_glibc.read)>(sym("read"));
+    g_glibc.write = reinterpret_cast<decltype(g_glibc.write)>(sym("write"));
+    g_glibc.fstat64 = reinterpret_cast<decltype(g_glibc.fstat64)>(sym("fstat64"));
+    g_glibc.iswctype = reinterpret_cast<decltype(g_glibc.iswctype)>(sym("iswctype"));
+    g_glibc.towlower = reinterpret_cast<decltype(g_glibc.towlower)>(sym("towlower"));
+    g_glibc.towupper = reinterpret_cast<decltype(g_glibc.towupper)>(sym("towupper"));
+    g_glibc.strcoll = reinterpret_cast<decltype(g_glibc.strcoll)>(sym("strcoll"));
+    g_glibc.strxfrm = reinterpret_cast<decltype(g_glibc.strxfrm)>(sym("strxfrm"));
+    g_glibc.strftime = reinterpret_cast<decltype(g_glibc.strftime)>(sym("strftime"));
+    g_glibc.wcscoll = reinterpret_cast<decltype(g_glibc.wcscoll)>(sym("wcscoll"));
+    g_glibc.wcsxfrm = reinterpret_cast<decltype(g_glibc.wcsxfrm)>(sym("wcsxfrm"));
+    g_glibc.wcsftime = reinterpret_cast<decltype(g_glibc.wcsftime)>(sym("wcsftime"));
     g_glibc.strcpy = reinterpret_cast<decltype(g_glibc.strcpy)>(sym("strcpy"));
     g_glibc.strcat = reinterpret_cast<decltype(g_glibc.strcat)>(sym("strcat"));
     g_glibc.strchr = reinterpret_cast<decltype(g_glibc.strchr)>(sym("strchr"));
@@ -1134,6 +1177,31 @@ WIN2LIN_EXPORT FILE* WINAPI fopen(const char* path, const char* mode) {
     return static_cast<FILE*>(g_glibc.fopen(path, mode));
 }
 
+// _wfopen: convert wide strings to UTF-8 and call fopen.
+static void wide_to_utf8(const wchar_t* w, char* out, size_t out_sz) {
+    size_t oi = 0;
+    for (size_t i = 0; w[i] && oi + 4 < out_sz; ++i) {
+        unsigned c = (unsigned)w[i];
+        if (c < 0x80) out[oi++] = (char)c;
+        else if (c < 0x800) {
+            out[oi++] = (char)(0xC0 | (c >> 6));
+            out[oi++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[oi++] = (char)(0xE0 | (c >> 12));
+            out[oi++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[oi++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    out[oi] = '\0';
+}
+WIN2LIN_EXPORT FILE* WINAPI _wfopen(const wchar_t* path, const wchar_t* mode) {
+    if (!path || !mode) return nullptr;
+    char pbuf[1024], mbuf[32];
+    wide_to_utf8(path, pbuf, sizeof(pbuf));
+    wide_to_utf8(mode, mbuf, sizeof(mbuf));
+    return fopen(pbuf, mbuf);
+}
+
 WIN2LIN_EXPORT int WINAPI putchar(int c) {
     ensure_crt();
     return g_glibc.putchar(c);
@@ -1248,3 +1316,95 @@ WIN2LIN_EXPORT void* WINAPI bsearch(const void* key, const void* base, size_t n,
     }
     return nullptr;
 }
+
+// ==========================================================================
+// Additional CRT exports for static libstdc++ (chrono / threads / locale).
+// ==========================================================================
+WIN2LIN_EXPORT void* WINAPI memchr(void* s, int c, size_t n) {
+    ensure_crt();
+    return g_glibc.memchr(s, c, n);
+}
+WIN2LIN_EXPORT char* WINAPI getenv(const char* name) {
+    ensure_crt();
+    return g_glibc.getenv(name);
+}
+WIN2LIN_EXPORT unsigned long WINAPI strtoul(const char* s, char** end, int base) {
+    ensure_crt();
+    return g_glibc.strtoul(s, end, base);
+}
+WIN2LIN_EXPORT int WINAPI setlocale(int cat, const char* loc) {
+    ensure_crt();
+    return g_glibc.setlocale(cat, loc);
+}
+WIN2LIN_EXPORT int WINAPI setvbuf(void* f, char* buf, int mode, size_t size) {
+    ensure_crt();
+    return g_glibc.setvbuf(f, buf, mode, size);
+}
+WIN2LIN_EXPORT int WINAPI _fileno(void* f) {
+    ensure_crt();
+    return g_glibc.fileno(f);
+}
+WIN2LIN_EXPORT void* WINAPI _fdopen(int fd, const char* mode) {
+    ensure_crt();
+    return g_glibc.fdopen(fd, mode);
+}
+WIN2LIN_EXPORT long long WINAPI _lseeki64(int fd, long long off, int whence) {
+    ensure_crt();
+    return g_glibc.lseek64 ? g_glibc.lseek64(fd, off, whence)
+                           : g_glibc.lseek(fd, off, whence);
+}
+WIN2LIN_EXPORT int WINAPI _read(int fd, void* buf, size_t n) {
+    ensure_crt();
+    return g_glibc.read(fd, buf, n);
+}
+WIN2LIN_EXPORT int WINAPI _write(int fd, const void* buf, size_t n) {
+    ensure_crt();
+    return g_glibc.write(fd, buf, n);
+}
+WIN2LIN_EXPORT int WINAPI _fstat64(int fd, void* st) {
+    ensure_crt();
+    return g_glibc.fstat64(fd, st);
+}
+WIN2LIN_EXPORT int WINAPI iswctype(unsigned wc, unsigned attr) {
+    ensure_crt();
+    return g_glibc.iswctype(wc, attr);
+}
+WIN2LIN_EXPORT unsigned WINAPI towlower(unsigned wc) {
+    ensure_crt();
+    return g_glibc.towlower(wc);
+}
+WIN2LIN_EXPORT unsigned WINAPI towupper(unsigned wc) {
+    ensure_crt();
+    return g_glibc.towupper(wc);
+}
+WIN2LIN_EXPORT int WINAPI strcoll(const char* a, const char* b) {
+    ensure_crt();
+    return g_glibc.strcoll(a, b);
+}
+WIN2LIN_EXPORT size_t WINAPI strxfrm(char* dst, const char* src, size_t n) {
+    ensure_crt();
+    return g_glibc.strxfrm(dst, src, n);
+}
+WIN2LIN_EXPORT size_t WINAPI wcscoll(const wchar_t* a, const wchar_t* b) {
+    ensure_crt();
+    return g_glibc.wcscoll(a, b);
+}
+WIN2LIN_EXPORT size_t WINAPI wcsxfrm(wchar_t* dst, const wchar_t* src, size_t n) {
+    ensure_crt();
+    return g_glibc.wcsxfrm(dst, src, n);
+}
+// strftime/wcsftime: <time.h> is included transitively and already declares
+// strftime with sysv_abi; we provide ms_abi wrappers via asm aliases so the
+// PE's ms_abi calls bind correctly while glibc keeps its own sysv_abi copy.
+static size_t WINAPI strftime_msabi(char* dst, size_t n, const char* fmt,
+                                    const struct tm* t) {
+    ensure_crt();
+    return g_glibc.strftime(dst, n, fmt, t);
+}
+static size_t WINAPI wcsftime_msabi(wchar_t* dst, size_t n, const wchar_t* fmt,
+                                    const struct tm* t) {
+    ensure_crt();
+    return g_glibc.wcsftime(dst, n, fmt, t);
+}
+__asm__(".globl strftime\n.set strftime, strftime_msabi\n");
+__asm__(".globl wcsftime\n.set wcsftime, wcsftime_msabi\n");

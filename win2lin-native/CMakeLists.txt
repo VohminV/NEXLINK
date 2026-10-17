@@ -18,6 +18,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIEF REQUIRED LIEF)
 
 find_package(Vulkan REQUIRED)
+find_package(SDL2 REQUIRED)
 
 enable_testing()
 

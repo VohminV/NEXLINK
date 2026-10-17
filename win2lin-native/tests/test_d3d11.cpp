@@ -1,13 +1,14 @@
-// Integration test for Phase 2: D3D11 shim + Vulkan backend.
+// Integration test for Phase 4: D3D11 shim + Vulkan swapchain + textures.
 //
 // Strategy:
-//   * Convert the MinGW D3D11 triangle fixture (d3d11_triangle.exe) with the
-//     relinker library directly.
-//   * Validate the produced ELF: DT_NEEDED covers d3d11/dxgi/msvcrt/kernel32,
-//     dynsym contains D3D11CreateDevice.
+//   * Convert the MinGW D3D11 textured-triangle fixture (d3d11_triangle.exe)
+//     with the relinker library directly.
+//   * Validate the produced ELF: DT_NEEDED covers d3d11/dxgi/msvcrt/kernel32
+//     (user32 is now also linked by the fixture).
 //   * Execute the relinked binary with the shim directory on LD_LIBRARY_PATH
-//     and verify: D3D11CreateDevice returns S_OK, CreateBuffer creates a real
-//     VkBuffer, Map/Unmap work, Draw is intercepted, and exit code is 0.
+//     and verify: window creation, device creation, texture/SRV/sampler,
+//     shader creation, Map/Unmap, Draw, Present (swapchain or headless),
+//     and exit code 0.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -130,7 +131,6 @@ bool dynsym_needed(const std::vector<uint8_t>& elf, const std::string& lib) {
             const auto* dyn = at<Elf64_Dyn>(elf, s.sh_offset + off);
             if (!dyn || dyn->d_tag == DT_NULL) break;
             if (dyn->d_tag == DT_NEEDED) {
-                // d_un.d_val is an offset into .dynstr; find .dynstr
                 for (int j = 0; j < ehdr->e_shnum; ++j) {
                     if (shdr[j].sh_type == SHT_STRTAB) {
                         if (cstr_at(elf, shdr[j].sh_offset + dyn->d_un.d_val) == lib)
@@ -150,7 +150,7 @@ int main() {
     const std::string shim_dir = WIN2LIN_SHIM_DIR;
     const std::string build_dir = WIN2LIN_TEST_BUILD_DIR;
 
-    std::cout << "=== D3D11 + Vulkan integration test ===\n";
+    std::cout << "=== D3D11 + Vulkan swapchain + textures integration test ===\n";
     std::cout << "PE: " << pe_path << "\n";
     std::cout << "Shims: " << shim_dir << "\n\n";
 
@@ -179,19 +179,36 @@ int main() {
     check(dynsym_needed(elf, "libwin_d3d11.so"), "DT_NEEDED has libwin_d3d11.so");
     check(dynsym_needed(elf, "libwin_msvcrt.so"), "DT_NEEDED has libwin_msvcrt.so");
     check(dynsym_needed(elf, "libwin_kernel32.so"), "DT_NEEDED has libwin_kernel32.so");
+    // The fixture now also links user32.
+    bool has_user32 = dynsym_needed(elf, "libwin_user32.so");
+    std::cout << "  [INFO] DT_NEEDED has libwin_user32.so: " << (has_user32 ? "yes" : "no") << "\n";
 
     // Validate dynsym contains D3D11 entry points.
     check(dynsym_has(elf, "D3D11CreateDeviceAndSwapChain"),
           "dynsym has D3D11CreateDeviceAndSwapChain");
 
-    // Execute the relinked binary.
+    // Execute the relinked binary (3s window hold + present loop).
     auto r = run_captured(elf_path, shim_dir);
     std::cout << "\n--- captured output ---\n" << r.out << "-----------------------\n";
     std::cout << "exit code: " << r.code << "\n\n";
 
     // Verify results.
+    {
+        const auto pos = r.out.find("CreateWindowExW -> hwnd=");
+        check(pos != std::string::npos && pos + 24 < r.out.size() &&
+                  r.out.substr(pos + 24, 16) != "0000000000000000",
+              "CreateWindowExW returned non-null HWND");
+    }
+    check(r.out.find("GetClientRect -> 800x600") != std::string::npos,
+          "GetClientRect reported 800x600");
     check(r.out.find("D3D11CreateDeviceAndSwapChain -> hr=0x00000000") != std::string::npos,
           "D3D11CreateDeviceAndSwapChain returned S_OK");
+    check(r.out.find("CreateTexture2D -> hr=0x00000000") != std::string::npos,
+          "CreateTexture2D returned S_OK");
+    check(r.out.find("CreateShaderResourceView -> hr=0x00000000") != std::string::npos,
+          "CreateShaderResourceView returned S_OK");
+    check(r.out.find("CreateSamplerState -> hr=0x00000000") != std::string::npos,
+          "CreateSamplerState returned S_OK");
     check(r.out.find("CreateVertexShader -> hr=0x00000000") != std::string::npos,
           "CreateVertexShader returned S_OK (stub SPIR-V)");
     check(r.out.find("CreatePixelShader -> hr=0x00000000") != std::string::npos,
@@ -205,37 +222,61 @@ int main() {
     check(r.out.find("Map -> hr=0x00000000") != std::string::npos,
           "Map returned S_OK");
     check(r.out.find("Unmap OK") != std::string::npos, "Unmap succeeded");
+    check(r.out.find("PSSetShaderResources OK") != std::string::npos,
+          "PSSetShaderResources executed");
+    check(r.out.find("PSSetSamplers OK") != std::string::npos,
+          "PSSetSamplers executed");
     check(r.out.find("Draw(3, 0) returned") != std::string::npos,
           "Draw(3, 0) executed without crash");
-    check(r.out.find("Present -> hr=0x00000000") != std::string::npos,
-          "Present returned S_OK");
+    check(r.out.find("Presenting for 3 seconds") != std::string::npos,
+          "fixture started 3-second present loop");
+    check(r.out.find("Presented") != std::string::npos && r.out.find("frames in 3 seconds") != std::string::npos,
+          "fixture presented frames for 3 seconds");
+    check(r.out.find("Present -> hr=0x00000000") != std::string::npos ||
+          r.out.find("Present (swapchain): execute_frame OK") != std::string::npos ||
+          r.out.find("execute_frame: submitted + presented") != std::string::npos ||
+          r.out.find("execute_frame: submitted (headless offscreen)") != std::string::npos,
+          "Present executed (swapchain or headless)");
     check(r.out.find("[d3d11-test] PASS") != std::string::npos, "app printed PASS");
     check(r.code == 0, "relinked D3D11 PE exits 0");
 
-    // Also verify the Vulkan backend logged device creation.
+    // Verify the Vulkan backend initialised.
     check(r.out.find("Vulkan backend initialised") != std::string::npos,
           "Vulkan backend initialised");
     check(r.out.find("Created VkBuffer") != std::string::npos,
           "VkBuffer was created for ID3D11Buffer");
+    check(r.out.find("Created VkImage") != std::string::npos,
+          "VkImage was created for ID3D11Texture2D");
+    check(r.out.find("Created VkSampler") != std::string::npos,
+          "VkSampler was created for ID3D11SamplerState");
     check(r.out.find("Created VkPipeline") != std::string::npos,
           "VkPipeline was created");
     check(r.out.find("Created VkRenderPass") != std::string::npos,
           "VkRenderPass was created");
-    check(r.out.find("Present: wrote triangle.ppm") != std::string::npos,
-          "Present wrote triangle.ppm");
+    check(r.out.find("descriptor set") != std::string::npos ||
+          r.out.find("Created descriptor set") != std::string::npos,
+          "Descriptor set was created");
 
-    // Verify the PPM file exists and has the expected header.
-    {
+    // Swapchain path (when a real window + display is available).
+    bool has_swapchain_log = r.out.find("Created VkSwapchainKHR") != std::string::npos ||
+                             r.out.find("Vulkan backend initialised with SDL swapchain") != std::string::npos;
+    bool has_headless_log = r.out.find("Present: wrote triangle.ppm") != std::string::npos ||
+                            r.out.find("execute_frame: submitted (headless offscreen)") != std::string::npos;
+    check(has_swapchain_log || has_headless_log,
+          "render path is either swapchain or headless offscreen");
+
+    // Headless path: PPM file.
+    if (has_headless_log && !has_swapchain_log) {
         std::string ppm_path = build_dir + "/triangle.ppm";
         std::ifstream ppm(ppm_path, std::ios::binary);
-        check(ppm.good(), "triangle.ppm exists on disk");
+        check(ppm.good(), "triangle.ppm exists on disk (headless path)");
         if (ppm.good()) {
             std::string magic;
             ppm >> magic;
             check(magic == "P6", "triangle.ppm is a valid P6 PPM");
             int w = 0, h = 0;
             ppm >> w >> h;
-            check(w == 640 && h == 480, "triangle.ppm is 640x480");
+            check(w == 800 && h == 600, "triangle.ppm is 800x600");
         }
     }
 

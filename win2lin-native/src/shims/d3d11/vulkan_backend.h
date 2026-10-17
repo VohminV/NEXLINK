@@ -1,19 +1,19 @@
 #pragma once
 
-// Vulkan backend for the D3D11 shim.
+// Vulkan backend for the D3D11 shim (Phase 4).
 //
 // Responsibilities:
 //   * Own the VkInstance / VkPhysicalDevice / VkDevice / VkQueue.
-//   * Provide headless presentation (VK_EXT_headless_surface) so we can
-//     exercise the full D3D11 path without a real X11/Wayland window.
-//   * Allocate VkBuffer + VkDeviceMemory for D3D11 buffers with correct
-//     memory-type selection (host-visible for DYNAMIC / CPU_ACCESS_WRITE).
-//   * Manage the "swap chain" as an offscreen VkImage + VkImageView that
-//     Present() reads back into a host-visible buffer and writes to disk.
+//   * Optional SDL2-backed presentation: init_with_sdl_window() enables the
+//     VK_KHR_surface / VK_KHR_swapchain path via SDL_Vulkan_*, creating a
+//     real VkSwapchainKHR with per-image views/framebuffers and semaphores.
+//   * Headless fallback: init() keeps the offscreen render-target path so
+//     tests can run without a display.
+//   * Allocate VkBuffer + VkDeviceMemory for D3D11 buffers.
 //   * Create VkRenderPass / VkFramebuffer / VkPipeline for the triangle.
 //
-// All public methods are SysV-ABI (this is Linux-side infrastructure, not
-// called from the PE).  The D3D11 shim (ms_abi) calls into this.
+// All public methods are SysV-ABI (Linux-side infrastructure, not called
+// from the PE).  The D3D11 shim (ms_abi) calls into this.
 
 #include <cstdint>
 #include <mutex>
@@ -34,7 +34,7 @@ struct VulkanBuffer {
     uint32_t memory_type = 0;
 };
 
-// Offscreen "swap chain" target: a color attachment image + view.
+// Offscreen "swap chain" target (headless path).
 struct VulkanRenderTarget {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -42,6 +42,23 @@ struct VulkanRenderTarget {
     uint32_t width = 0;
     uint32_t height = 0;
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+};
+
+// Real VkSwapchainKHR wrapper (SDL path).
+struct VulkanSwapchain {
+    VkSwapchainKHR handle = VK_NULL_HANDLE;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    std::vector<VkFramebuffer> framebuffers;
+    VkSemaphore image_available = VK_NULL_HANDLE;
+    VkSemaphore render_finished = VK_NULL_HANDLE;
+    VkFence in_flight = VK_NULL_HANDLE;
+    uint32_t image_index = 0;
+    bool valid = false;
 };
 
 class VulkanBackend {
@@ -52,10 +69,16 @@ public:
     VulkanBackend(const VulkanBackend&) = delete;
     VulkanBackend& operator=(const VulkanBackend&) = delete;
 
-    // Initialise instance + device.  Returns true on success.
+    // Headless init (no SDL window). Returns true on success.
     bool init();
 
+    // SDL-backed init: enables VK_KHR_surface / VK_KHR_swapchain, creates a
+    // VkSurfaceKHR from the SDL_Window, then a real VkSwapchainKHR.
+    // sdl_window is an SDL_Window*.
+    bool init_with_sdl_window(void* sdl_window, uint32_t width, uint32_t height);
+
     bool is_ready() const { return ready_; }
+    bool has_swapchain() const { return swapchain_.valid; }
 
     VkInstance instance() const { return instance_; }
     VkPhysicalDevice physical_device() const { return physical_device_; }
@@ -63,7 +86,9 @@ public:
     VkQueue graphics_queue() const { return graphics_queue_; }
     uint32_t graphics_queue_family() const { return graphics_queue_family_; }
     VkCommandPool command_pool() const { return cmd_pool_; }
-    VkFormat swapchain_format() const { return rt_.format; }
+    VkFormat swapchain_format() const {
+        return swapchain_.valid ? swapchain_.format : rt_.format;
+    }
 
     // ---- Buffers -----------------------------------------------------------
     bool create_buffer(VkDeviceSize size,
@@ -74,31 +99,43 @@ public:
     void* map_buffer(VulkanBuffer* buf);
     void unmap_buffer(VulkanBuffer* buf);
 
-    // ---- Offscreen render target (swap chain substitute) -------------------
-    // Creates a VkImage + VkImageView of the requested size / format.
+    // ---- Offscreen render target (headless swap chain substitute) ----------
     bool create_render_target(uint32_t width, uint32_t height, VkFormat format);
     VulkanRenderTarget& render_target() { return rt_; }
     const VulkanRenderTarget& render_target() const { return rt_; }
 
+    // ---- Swapchain accessors ------------------------------------------------
+    VulkanSwapchain& swapchain() { return swapchain_; }
+    const VulkanSwapchain& swapchain() const { return swapchain_; }
+
+    // Acquire the next swapchain image (waits on in_flight fence).
+    bool acquire_next_image();
+
+    // Submit a recorded command buffer for the current image with semaphore
+    // sync (image_available -> render_finished, signals in_flight fence).
+    bool submit_frame(VkCommandBuffer cmd);
+
+    // Present the current image, waiting on render_finished.
+    bool present_frame();
+
+    // Current framebuffer for the acquired image (swapchain) or offscreen RT.
+    VkFramebuffer current_framebuffer();
+    VkRenderPass current_render_pass();
+    uint32_t current_width() const;
+    uint32_t current_height() const;
+
     // ---- Render pass --------------------------------------------------------
-    // Single color attachment, loadOp from clear color, storeOp = STORE.
-    // Created lazily on first ensure_render_pass() call.
     VkRenderPass render_pass() const { return render_pass_; }
     bool ensure_render_pass();
+    bool ensure_swapchain_render_pass();
 
-    // ---- Framebuffer --------------------------------------------------------
-    // Bound to the current render target.  Recreated if RT changes size.
+    // ---- Framebuffer (offscreen) -------------------------------------------
     VkFramebuffer framebuffer() const { return framebuffer_; }
     bool ensure_framebuffer();
 
-    // ---- Graphics pipeline ---------------------------------------------------
-    // The pipeline is owned by the caller (context) and built from D3D11
-    // state.  This helper just exposes the render pass / format it needs.
-    VkFormat color_attachment_format() const { return rt_.format; }
+    VkFormat color_attachment_format() const { return swapchain_format(); }
 
-    // ---- Readback ------------------------------------------------------------
-    // Transition the RT image to TRANSFER_SRC, copy to a host-visible buffer,
-    // map it, and write a PPM file.  Returns true on success.
+    // ---- Readback (headless path only) --------------------------------------
     bool readback_and_write_ppm(const std::string& path);
 
     // ---- One-shot command helpers --------------------------------------------
@@ -109,10 +146,12 @@ public:
                               VkMemoryPropertyFlags props) const;
 
 private:
-    bool create_instance();
+    bool create_instance(const std::vector<const char*>& extra_inst_exts);
     bool pick_physical_device();
-    bool create_device();
+    bool create_device(const std::vector<const char*>& dev_exts);
     void destroy_render_target();
+    void destroy_swapchain();
+    bool create_swapchain_objects(uint32_t width, uint32_t height);
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
@@ -126,12 +165,19 @@ private:
     // Headless surface (optional).
     VkSurfaceKHR headless_surface_ = VK_NULL_HANDLE;
 
-    // Offscreen render target.
+    // Offscreen render target (headless path).
     VulkanRenderTarget rt_{};
 
-    // Render pass + framebuffer.
-    VkRenderPass render_pass_ = VK_NULL_HANDLE;
+    // Real swapchain (SDL path).
+    VulkanSwapchain swapchain_{};
+
+    // Render passes + framebuffers.
+    VkRenderPass render_pass_ = VK_NULL_HANDLE;         // offscreen
+    VkRenderPass swapchain_render_pass_ = VK_NULL_HANDLE; // swapchain
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+
+    // Persistent per-frame command buffer for swapchain rendering.
+    VkCommandBuffer frame_cmd_ = VK_NULL_HANDLE;
 };
 
 // Process-wide singleton (thread-safe lazy init).

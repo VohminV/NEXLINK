@@ -1,21 +1,23 @@
-// libwin_user32.so - mock windowing shim (Phase 1.5).
+// libwin_user32.so - Win32 windowing shim backed by SDL2 (Phase 4).
 //
-// Real window creation (X11/Wayland) is deferred to a later phase: right now
-// the goal is to let a standard Win32 application run past window setup and
-// reach graphics initialization. Every function therefore returns success
-// with plausible mock values:
+// CreateWindowExW creates a real SDL_Window (SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN)
+// and hands back a synthetic HWND (heap-allocated WindowInfo*).  The HWND<->SDL_Window
+// registry is exported via win2lin_user32_get_sdl_window() (SysV ABI) so the D3D11
+// shim can call SDL_Vulkan_CreateSurface / SDL_Vulkan_GetInstanceExtensions.
 //
-//   RegisterClassExW -> monotonically increasing ATOM
-//   CreateWindowExW  -> shared mock HWND (0xDEADBEEF) backed by a window
-//                       record (size, style, WndProc) so GetClientRect /
-//                       GetWindowRect / DispatchMessageW behave sanely
-//   ShowWindow/UpdateWindow/SetForegroundWindow -> TRUE
-//   GetClientRect/GetWindowRect -> requested size, clamped to 1920x1080
+// If SDL initialisation or window creation fails (headless CI, no display),
+// the shim falls back to the Phase 1.5 mock (no SDL_Window, synthetic sizes).
+// GetClientRect / GetWindowRect / message-pump stubs all work in both modes.
 //
-// Anything not yet modelled logs "[NEXLINK USER32 UNIMPL] <name>" and returns
-// a safe default (0 / FALSE / S_OK-equivalent) so the app keeps running.
+// Message pump: PeekMessageW / GetMessageW translate SDL events (SDL_QUIT ->
+// WM_QUIT, SDL_KEYDOWN/UP -> WM_KEYDOWN/UP, SDL_MOUSEMOTION -> WM_MOUSEMOVE, ...)
+// into Win32 MSG structures so a real application's message loop terminates
+// cleanly when the window is closed.
 
 #include "common/win32.hpp"
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
 
 #include <cstdio>
 #include <cstring>
@@ -23,31 +25,25 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 using namespace win2lin::win;
 
 namespace {
 
 // --------------------------------------------------------------------------
-// Logging / mock constants
+// Logging
 // --------------------------------------------------------------------------
-const HWND MOCK_HWND = reinterpret_cast<HWND>(static_cast<uintptr_t>(0xDEADBEEF));
-const HWND MOCK_DESKTOP_HWND = reinterpret_cast<HWND>(static_cast<uintptr_t>(0xDEAD0000));
-const HDC MOCK_HDC = reinterpret_cast<HDC>(static_cast<uintptr_t>(0xD1));
-const HCURSOR MOCK_HCURSOR = reinterpret_cast<HCURSOR>(static_cast<uintptr_t>(0xC1));
-const HICON MOCK_HICON = reinterpret_cast<HICON>(static_cast<uintptr_t>(0xC2));
-constexpr LONG MOCK_SCREEN_W = 1920;
-constexpr LONG MOCK_SCREEN_H = 1080;
-
 #define USER32_UNIMPL(name)                                                    \
     fprintf(stderr, "[NEXLINK USER32 UNIMPL] %s\n", name)
 
-#define USER32_INFO(fmt, ...) fprintf(stderr, "[NEXLINK USER32] " fmt "\n", __VA_ARGS__)
+#define USER32_INFO(fmt, ...) fprintf(stderr, "[NEXLINK USER32] " fmt "\n", ##__VA_ARGS__)
+
+constexpr LONG MOCK_SCREEN_W = 1920;
+constexpr LONG MOCK_SCREEN_H = 1080;
 
 // --------------------------------------------------------------------------
-// Window / class registries. The mock world has one HWND shared by all
-// CreateWindowExW calls; per-window records still track size and the WndProc
-// so DispatchMessageW can invoke application code.
+// Window / class registries.
 // --------------------------------------------------------------------------
 struct WindowClass {
     WNDPROC wndproc = nullptr;
@@ -55,6 +51,7 @@ struct WindowClass {
 };
 
 struct WindowInfo {
+    void* sdl_window = nullptr; // SDL_Window* (nullptr in mock/headless mode)
     LONG x = 0, y = 0;
     LONG width = MOCK_SCREEN_W, height = MOCK_SCREEN_H;
     UINT style = 0;
@@ -65,14 +62,29 @@ struct WindowInfo {
 std::mutex g_mutex;
 std::map<ATOM, WindowClass> g_classes;
 std::map<std::u16string, ATOM> g_class_names;
-WindowInfo g_window;
+std::map<HWND, WindowInfo> g_windows;
 unsigned g_next_atom = 1;
+bool g_sdl_inited = false;
+std::vector<MSG> g_msg_queue; // translated SDL events waiting for GetMessageW
 
+// Synthetic HWNDs: opaque heap pointers into WindowInfo values.
+// (The map key IS the HWND; we allocate a dummy byte so each HWND is unique.)
+
+HWND make_hwnd() {
+    // Each WindowInfo is stored by value in the map; the key is a unique
+    // heap pointer that never aliases.
+    static char sink;
+    (void)sink;
+    auto* key = new char; // unique address
+    return reinterpret_cast<HWND>(key);
+}
+
+// --------------------------------------------------------------------------
+// UTF helpers (unchanged from Phase 1.5).
+// --------------------------------------------------------------------------
 std::u16string utf8_to_utf16(const char* s) {
     std::u16string w;
     if (!s) return w;
-    // Minimal UTF-8 -> UTF-16 (ASCII + 2/3-byte sequences suffice for mock
-    // class names; unknown bytes become '?' rather than failing).
     for (size_t i = 0; s[i];) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
         if (c < 0x80) {
@@ -115,7 +127,6 @@ std::string utf16_to_utf8(const WCHAR* w) {
     return out;
 }
 
-// MAKEINTRESOURCEW ids are small integers cast to pointers.
 bool is_int_resource(LPCWSTR s) {
     return reinterpret_cast<uintptr_t>(s) < 0x10000;
 }
@@ -123,14 +134,103 @@ bool is_int_resource(LPCWSTR s) {
 ATOM register_class(WNDPROC wndproc, const std::u16string& name) {
     std::lock_guard<std::mutex> lk(g_mutex);
     auto it = g_class_names.find(name);
-    if (it != g_class_names.end()) return it->second; // re-registration: same ATOM
+    if (it != g_class_names.end()) return it->second;
     const ATOM atom = static_cast<ATOM>(g_next_atom++);
     g_classes[atom] = {wndproc, name};
     g_class_names[name] = atom;
     return atom;
 }
 
+bool ensure_sdl() {
+    if (g_sdl_inited) return true;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        USER32_INFO("SDL_InitSubSystem(VIDEO) failed: %s", SDL_GetError());
+        return false;
+    }
+    g_sdl_inited = true;
+    USER32_INFO("SDL2 video subsystem initialised");
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// SDL event -> Win32 MSG translation.
+// --------------------------------------------------------------------------
+void translate_and_queue_events() {
+    if (!g_sdl_inited) return;
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        MSG msg{};
+        switch (e.type) {
+        case SDL_QUIT:
+            msg.message = 0x0012; // WM_QUIT
+            break;
+        case SDL_KEYDOWN:
+            msg.message = 0x0100; // WM_KEYDOWN
+            msg.wParam = e.key.keysym.sym;
+            break;
+        case SDL_KEYUP:
+            msg.message = 0x0101; // WM_KEYUP
+            msg.wParam = e.key.keysym.sym;
+            break;
+        case SDL_MOUSEMOTION:
+            msg.message = 0x0200; // WM_MOUSEMOVE
+            msg.lParam = (static_cast<int64_t>(e.motion.y) << 16) |
+                         (static_cast<int64_t>(e.motion.x) & 0xFFFF);
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            msg.message = 0x0201; // WM_LBUTTONDOWN
+            msg.wParam = e.button.button;
+            break;
+        case SDL_MOUSEBUTTONUP:
+            msg.message = 0x0202; // WM_LBUTTONUP
+            msg.wParam = e.button.button;
+            break;
+        case SDL_WINDOWEVENT:
+            switch (e.window.event) {
+            case SDL_WINDOWEVENT_CLOSE:
+                msg.message = 0x0010; // WM_CLOSE
+                break;
+            case SDL_WINDOWEVENT_RESIZED:
+                msg.message = 0x0005; // WM_SIZE
+                msg.wParam = 0;
+                msg.lParam = (static_cast<int64_t>(e.window.data2) << 16) |
+                             (static_cast<int64_t>(e.window.data1) & 0xFFFF);
+                break;
+            default:
+                continue; // skip uninteresting window events
+            }
+            break;
+        default:
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (auto& kv : g_windows) {
+            if (kv.second.sdl_window) {
+                auto* w = static_cast<SDL_Window*>(kv.second.sdl_window);
+                if (SDL_GetWindowID(w) == e.window.windowID || e.type == SDL_QUIT) {
+                    msg.hwnd = kv.first;
+                    break;
+                }
+            }
+        }
+        if (!msg.hwnd && !g_windows.empty())
+            msg.hwnd = g_windows.begin()->first;
+        g_msg_queue.push_back(msg);
+    }
+}
+
 } // namespace
+
+// ==========================================================================
+// Internal export for the D3D11 shim (SysV ABI).
+// ==========================================================================
+extern "C" WIN2LIN_EXPORT void* win2lin_user32_get_sdl_window(void* hwnd) {
+    if (!hwnd) return nullptr;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(static_cast<HWND>(hwnd));
+    if (it == g_windows.end()) return nullptr;
+    return it->second.sdl_window;
+}
 
 // ==========================================================================
 // Classes
@@ -148,15 +248,10 @@ WIN2LIN_EXPORT ATOM WINAPI RegisterClassExW(const WNDCLASSEXW* wc) {
 }
 
 WIN2LIN_EXPORT ATOM WINAPI RegisterClassW(const WNDCLASSEXW* wc) {
-    // MinGW headers route RegisterClassW through the same layout minus the
-    // extra fields; reuse RegisterClassExW (cbSize field may be absent, but
-    // lpfnWndProc/lpszClassName share the offsets).
     return RegisterClassExW(wc);
 }
 
 WIN2LIN_EXPORT ATOM WINAPI RegisterClassExA(const void* wc) {
-    // Layout-compatible with WNDCLASSEXW except char* strings; extract the
-    // pieces we need without pulling in the A-struct definition.
     struct WNDCLASSEXA_LOCAL {
         UINT cbSize;
         UINT style;
@@ -212,25 +307,61 @@ WIN2LIN_EXPORT HWND WINAPI CreateWindowExW(DWORD ex_style, LPCWSTR class_name,
             auto it = g_class_names.find(std::u16string(class_name));
             if (it != g_class_names.end()) wndproc = g_classes[it->second].wndproc;
         }
-        g_window.x = (x == static_cast<int>(0x80000000)) ? 0 : x; // CW_USEDEFAULT
-        g_window.y = (y == static_cast<int>(0x80000000)) ? 0 : y;
-        g_window.width = (width <= 0 || width == static_cast<int>(0x80000000))
-                             ? MOCK_SCREEN_W
-                             : width;
-        g_window.height = (height <= 0 || height == static_cast<int>(0x80000000))
-                              ? MOCK_SCREEN_H
-                              : height;
-        g_window.style = style;
-        g_window.visible = false;
-        g_window.wndproc = wndproc;
     }
-    USER32_INFO("CreateWindowExW class='%s' title='%s' -> HWND %p",
+
+    const int win_w = (width <= 0 || width == static_cast<int>(0x80000000))
+                          ? MOCK_SCREEN_W
+                          : width;
+    const int win_h = (height <= 0 || height == static_cast<int>(0x80000000))
+                          ? MOCK_SCREEN_H
+                          : height;
+    const int win_x = (x == static_cast<int>(0x80000000)) ? 0 : x;
+    const int win_y = (y == static_cast<int>(0x80000000)) ? 0 : y;
+
+    const std::string title = window_name ? utf16_to_utf8(window_name) : "NEXLINK";
+
+    void* sdl_win = nullptr;
+    if (ensure_sdl()) {
+        // Prefer a Vulkan-capable window so D3D11 can create a real surface.
+        Uint32 sdl_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+        SDL_Window* w = SDL_CreateWindow(title.c_str(), win_x, win_y, win_w, win_h,
+                                         sdl_flags | SDL_WINDOW_VULKAN);
+        if (!w) {
+            USER32_INFO("SDL_CreateWindow(VULKAN) failed: %s; retrying without", SDL_GetError());
+            w = SDL_CreateWindow(title.c_str(), win_x, win_y, win_w, win_h, sdl_flags);
+        }
+        if (w) {
+            sdl_win = w;
+            int rw = 0, rh = 0;
+            SDL_GetWindowSize(w, &rw, &rh);
+            USER32_INFO("SDL_CreateWindow '%s' -> %p (%dx%d, vulkan=%d)", title.c_str(),
+                        static_cast<void*>(w), rw, rh,
+                        (SDL_GetWindowFlags(w) & SDL_WINDOW_VULKAN) ? 1 : 0);
+        } else {
+            USER32_INFO("SDL_CreateWindow failed: %s", SDL_GetError());
+        }
+    }
+
+    HWND hwnd = make_hwnd();
+    WindowInfo info{};
+    info.sdl_window = sdl_win;
+    info.x = win_x;
+    info.y = win_y;
+    info.width = win_w;
+    info.height = win_h;
+    info.style = style;
+    info.visible = false;
+    info.wndproc = wndproc;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_windows[hwnd] = info;
+    }
+    USER32_INFO("CreateWindowExW class='%s' title='%s' -> HWND %p (sdl=%p)",
                 class_name && !is_int_resource(class_name)
                     ? utf16_to_utf8(class_name).c_str()
                     : "(resource)",
-                window_name ? utf16_to_utf8(window_name).c_str() : "",
-                static_cast<void*>(MOCK_HWND));
-    return MOCK_HWND;
+                title.c_str(), static_cast<void*>(hwnd), sdl_win);
+    return hwnd;
 }
 
 WIN2LIN_EXPORT HWND WINAPI CreateWindowExA(DWORD ex, LPCSTR class_name, LPCSTR window_name,
@@ -253,75 +384,105 @@ WIN2LIN_EXPORT LRESULT WINAPI DefWindowProcA(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 WIN2LIN_EXPORT BOOL WINAPI DestroyWindow(HWND hwnd) {
-    if (hwnd != MOCK_HWND) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_window.visible = false;
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    if (it->second.sdl_window) {
+        SDL_Window* w = static_cast<SDL_Window*>(it->second.sdl_window);
+        SDL_DestroyWindow(w);
+    }
+    g_windows.erase(it);
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI ShowWindow(HWND hwnd, int cmd) {
-    if (hwnd != MOCK_HWND) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_window.visible = (cmd != 0 /* SW_HIDE */);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    it->second.visible = (cmd != 0 /* SW_HIDE */);
+    if (it->second.sdl_window) {
+        if (cmd == 0) SDL_HideWindow(static_cast<SDL_Window*>(it->second.sdl_window));
+        else SDL_ShowWindow(static_cast<SDL_Window*>(it->second.sdl_window));
+    }
     USER32_INFO("ShowWindow cmd=%d", cmd);
-    return 1; // previous visibility was "hidden"
+    return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI UpdateWindow(HWND hwnd) {
-    return hwnd == MOCK_HWND ? 1 : 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_windows.count(hwnd) ? 1 : 0;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI SetForegroundWindow(HWND hwnd) {
-    return hwnd == MOCK_HWND ? 1 : 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    if (it->second.sdl_window)
+        SDL_RaiseWindow(static_cast<SDL_Window*>(it->second.sdl_window));
+    return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI GetClientRect(HWND hwnd, RECT* rc) {
-    if (hwnd != MOCK_HWND || !rc) return 0;
+    if (!rc) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
     rc->left = 0;
     rc->top = 0;
-    rc->right = g_window.width;
-    rc->bottom = g_window.height;
+    if (it->second.sdl_window) {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(static_cast<SDL_Window*>(it->second.sdl_window), &w, &h);
+        rc->right = w;
+        rc->bottom = h;
+        it->second.width = w;
+        it->second.height = h;
+    } else {
+        rc->right = it->second.width;
+        rc->bottom = it->second.height;
+    }
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI GetWindowRect(HWND hwnd, RECT* rc) {
-    if (hwnd != MOCK_HWND || !rc) return 0;
+    if (!rc) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    // Mock non-client frame: 8px border + 32px title bar.
-    rc->left = g_window.x - 8;
-    rc->top = g_window.y - 32;
-    rc->right = g_window.x + g_window.width + 8;
-    rc->bottom = g_window.y + g_window.height + 8;
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    rc->left = it->second.x - 8;
+    rc->top = it->second.y - 32;
+    rc->right = it->second.x + it->second.width + 8;
+    rc->bottom = it->second.y + it->second.height + 8;
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI MoveWindow(HWND hwnd, int x, int y, int w, int h, BOOL) {
-    if (hwnd != MOCK_HWND) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_window.x = x;
-    g_window.y = y;
-    g_window.width = w;
-    g_window.height = h;
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    it->second.x = x;
+    it->second.y = y;
+    it->second.width = w;
+    it->second.height = h;
+    if (it->second.sdl_window)
+        SDL_SetWindowSize(static_cast<SDL_Window*>(it->second.sdl_window), w, h);
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI SetWindowPos(HWND hwnd, HWND, int x, int y, int w, int h,
                                         UINT flags) {
     (void)flags;
-    if (hwnd != MOCK_HWND) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (x != static_cast<int>(0x80000000)) g_window.x = x;
-    if (y != static_cast<int>(0x80000000)) g_window.y = y;
-    if (w > 0) g_window.width = w;
-    if (h > 0) g_window.height = h;
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    if (x != static_cast<int>(0x80000000)) it->second.x = x;
+    if (y != static_cast<int>(0x80000000)) it->second.y = y;
+    if (w > 0) it->second.width = w;
+    if (h > 0) it->second.height = h;
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI AdjustWindowRectEx(RECT* rc, DWORD, BOOL) {
     if (!rc) return 0;
-    // Pretend the caller already asked for client coordinates; grow by the
-    // same mock frame GetWindowRect reports.
     rc->left -= 8;
     rc->top -= 32;
     rc->right += 8;
@@ -329,113 +490,164 @@ WIN2LIN_EXPORT BOOL WINAPI AdjustWindowRectEx(RECT* rc, DWORD, BOOL) {
     return 1;
 }
 
-WIN2LIN_EXPORT BOOL WINAPI IsWindow(HWND hwnd) { return hwnd == MOCK_HWND; }
-WIN2LIN_EXPORT BOOL WINAPI IsWindowVisible(HWND hwnd) {
-    if (hwnd != MOCK_HWND) return 0;
+WIN2LIN_EXPORT BOOL WINAPI IsWindow(HWND hwnd) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    return g_window.visible ? 1 : 0;
+    return g_windows.count(hwnd) ? 1 : 0;
+}
+WIN2LIN_EXPORT BOOL WINAPI IsWindowVisible(HWND hwnd) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    return it->second.visible ? 1 : 0;
 }
 WIN2LIN_EXPORT BOOL WINAPI IsIconic(HWND) { return 0; }
 WIN2LIN_EXPORT BOOL WINAPI OpenIcon(HWND) { return 1; }
 WIN2LIN_EXPORT BOOL WINAPI EnableWindow(HWND, BOOL) { return 1; }
 
-WIN2LIN_EXPORT HWND WINAPI GetDesktopWindow(void) { return MOCK_DESKTOP_HWND; }
-WIN2LIN_EXPORT HWND WINAPI GetForegroundWindow(void) { return MOCK_HWND; }
+WIN2LIN_EXPORT HWND WINAPI GetDesktopWindow(void) {
+    return reinterpret_cast<HWND>(static_cast<uintptr_t>(0xDEAD0000));
+}
+WIN2LIN_EXPORT HWND WINAPI GetForegroundWindow(void) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_windows.empty() ? nullptr : g_windows.begin()->first;
+}
 WIN2LIN_EXPORT HWND WINAPI GetParent(HWND) { return nullptr; }
 WIN2LIN_EXPORT HWND WINAPI SetParent(HWND, HWND) { return nullptr; }
 WIN2LIN_EXPORT HWND WINAPI GetWindow(HWND, UINT) { return nullptr; }
 
 WIN2LIN_EXPORT BOOL WINAPI ClientToScreen(HWND hwnd, POINT* pt) {
-    if (hwnd != MOCK_HWND || !pt) return 0;
+    if (!pt) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    pt->x += g_window.x;
-    pt->y += g_window.y;
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    pt->x += it->second.x;
+    pt->y += it->second.y;
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI ScreenToClient(HWND hwnd, POINT* pt) {
-    if (hwnd != MOCK_HWND || !pt) return 0;
+    if (!pt) return 0;
     std::lock_guard<std::mutex> lk(g_mutex);
-    pt->x -= g_window.x;
-    pt->y -= g_window.y;
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    pt->x -= it->second.x;
+    pt->y -= it->second.y;
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI SetWindowTextW(HWND hwnd, LPCWSTR text) {
-    if (hwnd != MOCK_HWND) return 0;
-    (void)text;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    if (it->second.sdl_window && text) {
+        const std::string t = utf16_to_utf8(text);
+        SDL_SetWindowTitle(static_cast<SDL_Window*>(it->second.sdl_window), t.c_str());
+    }
     return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI SetWindowTextA(HWND hwnd, LPCSTR text) {
-    if (hwnd != MOCK_HWND) return 0;
-    (void)text;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end()) return 0;
+    if (it->second.sdl_window && text) {
+        SDL_SetWindowTitle(static_cast<SDL_Window*>(it->second.sdl_window), text);
+    }
     return 1;
 }
 
-WIN2LIN_EXPORT int WINAPI GetWindowTextW(HWND, LPWSTR buf, int max_count) {
-    if (buf && max_count > 0) buf[0] = 0;
-    return 0;
+WIN2LIN_EXPORT int WINAPI GetWindowTextW(HWND hwnd, LPWSTR buf, int max_count) {
+    if (!buf || max_count <= 0) return 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end() || !it->second.sdl_window) {
+        buf[0] = 0;
+        return 0;
+    }
+    const char* t = SDL_GetWindowTitle(static_cast<SDL_Window*>(it->second.sdl_window));
+    const std::u16string w = utf8_to_utf16(t);
+    int n = 0;
+    for (; n < max_count - 1 && n < static_cast<int>(w.size()); ++n) buf[n] = w[n];
+    buf[n] = 0;
+    return n;
 }
 
-WIN2LIN_EXPORT int WINAPI GetWindowTextA(HWND, LPSTR buf, int max_count) {
-    if (buf && max_count > 0) buf[0] = 0;
-    return 0;
+WIN2LIN_EXPORT int WINAPI GetWindowTextA(HWND hwnd, LPSTR buf, int max_count) {
+    if (!buf || max_count <= 0) return 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto it = g_windows.find(hwnd);
+    if (it == g_windows.end() || !it->second.sdl_window) {
+        buf[0] = 0;
+        return 0;
+    }
+    const char* t = SDL_GetWindowTitle(static_cast<SDL_Window*>(it->second.sdl_window));
+    int n = 0;
+    for (; n < max_count - 1 && t[n]; ++n) buf[n] = t[n];
+    buf[n] = 0;
+    return n;
 }
 
-WIN2LIN_EXPORT BOOL WINAPI BringWindowToTop(HWND hwnd) { return hwnd == MOCK_HWND; }
+WIN2LIN_EXPORT BOOL WINAPI BringWindowToTop(HWND hwnd) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_windows.count(hwnd) ? 1 : 0;
+}
 
 // ==========================================================================
-// Cursors / icons / DCs
+// Cursors / icons / DCs (unchanged mocks).
 // ==========================================================================
 WIN2LIN_EXPORT HCURSOR WINAPI LoadCursorW(HINSTANCE inst, LPCWSTR name) {
-    (void)inst;
-    // Integer resources (IDC_ARROW=32512 etc.) and named cursors both resolve
-    // to the same mock handle.
-    return MOCK_HCURSOR;
+    (void)inst; (void)name;
+    return reinterpret_cast<HCURSOR>(static_cast<uintptr_t>(0xC1));
 }
-
 WIN2LIN_EXPORT HCURSOR WINAPI LoadCursorA(HINSTANCE inst, LPCSTR name) {
     (void)inst; (void)name;
-    return MOCK_HCURSOR;
+    return reinterpret_cast<HCURSOR>(static_cast<uintptr_t>(0xC1));
 }
-
 WIN2LIN_EXPORT HICON WINAPI LoadIconW(HINSTANCE inst, LPCWSTR name) {
     (void)inst; (void)name;
-    return MOCK_HICON;
+    return reinterpret_cast<HICON>(static_cast<uintptr_t>(0xC2));
 }
-
 WIN2LIN_EXPORT HICON WINAPI LoadIconA(HINSTANCE inst, LPCSTR name) {
     (void)inst; (void)name;
-    return MOCK_HICON;
+    return reinterpret_cast<HICON>(static_cast<uintptr_t>(0xC2));
 }
-
 WIN2LIN_EXPORT HDC WINAPI GetDC(HWND hwnd) {
-    if (hwnd != MOCK_HWND && hwnd != MOCK_DESKTOP_HWND) return nullptr;
-    return MOCK_HDC;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (g_windows.count(hwnd)) return reinterpret_cast<HDC>(static_cast<uintptr_t>(0xD1));
+    return nullptr;
 }
-
 WIN2LIN_EXPORT int WINAPI ReleaseDC(HWND, HDC) { return 1; }
-
 WIN2LIN_EXPORT HDC WINAPI BeginPaint(HWND hwnd, void* ps) {
-    if (ps) std::memset(ps, 0, 64); // PAINTSTRUCT is larger; zero a safe prefix
-    return hwnd == MOCK_HWND ? MOCK_HDC : nullptr;
+    if (ps) std::memset(ps, 0, 64);
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_windows.count(hwnd) ? reinterpret_cast<HDC>(static_cast<uintptr_t>(0xD1))
+                                 : nullptr;
 }
-
 WIN2LIN_EXPORT BOOL WINAPI EndPaint(HWND, const void*) { return 1; }
-
 WIN2LIN_EXPORT BOOL WINAPI InvalidateRect(HWND hwnd, const RECT*, BOOL) {
-    return hwnd == MOCK_HWND ? 1 : 0;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_windows.count(hwnd) ? 1 : 0;
 }
 
 // ==========================================================================
-// Message loop
+// Message loop (SDL event translation).
 // ==========================================================================
 WIN2LIN_EXPORT BOOL WINAPI PeekMessageW(MSG* msg, HWND hwnd, UINT min, UINT max,
                                         UINT remove) {
-    (void)hwnd; (void)min; (void)max; (void)remove;
-    if (msg) std::memset(msg, 0, sizeof(MSG));
-    return 0; // no pending messages in the mock world
+    (void)min; (void)max; (void)remove;
+    if (!msg) return 0;
+    translate_and_queue_events();
+    std::lock_guard<std::mutex> lk(g_mutex);
+    // Filter by hwnd if requested (0 == any).
+    for (auto it = g_msg_queue.begin(); it != g_msg_queue.end(); ++it) {
+        if (hwnd == nullptr || it->hwnd == hwnd) {
+            *msg = *it;
+            g_msg_queue.erase(it);
+            return 1;
+        }
+    }
+    std::memset(msg, 0, sizeof(MSG));
+    return 0;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI PeekMessageA(MSG* msg, HWND hwnd, UINT min, UINT max,
@@ -444,12 +656,38 @@ WIN2LIN_EXPORT BOOL WINAPI PeekMessageA(MSG* msg, HWND hwnd, UINT min, UINT max,
 }
 
 WIN2LIN_EXPORT BOOL WINAPI GetMessageW(MSG* msg, HWND hwnd, UINT min, UINT max) {
-    (void)hwnd; (void)min; (void)max;
-    if (msg) {
-        std::memset(msg, 0, sizeof(MSG));
-        msg->message = 0x0012; // WM_QUIT: loop terminates immediately
+    (void)min; (void)max;
+    if (!msg) return 0;
+    translate_and_queue_events();
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (auto it = g_msg_queue.begin(); it != g_msg_queue.end(); ++it) {
+            if (hwnd == nullptr || it->hwnd == hwnd) {
+                *msg = *it;
+                g_msg_queue.erase(it);
+                if (msg->message == 0x0012) return 0; // WM_QUIT -> FALSE
+                return 1;
+            }
+        }
     }
-    return 0; // FALSE == WM_QUIT received
+    // No event: block briefly on SDL (up to ~16ms) then re-check once.
+    if (g_sdl_inited) {
+        SDL_Delay(16);
+        translate_and_queue_events();
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (auto it = g_msg_queue.begin(); it != g_msg_queue.end(); ++it) {
+            if (hwnd == nullptr || it->hwnd == hwnd) {
+                *msg = *it;
+                g_msg_queue.erase(it);
+                if (msg->message == 0x0012) return 0;
+                return 1;
+            }
+        }
+    }
+    // Fallback: report WM_QUIT so loops terminate (headless / no events).
+    std::memset(msg, 0, sizeof(MSG));
+    msg->message = 0x0012;
+    return 0;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI GetMessageA(MSG* msg, HWND hwnd, UINT min, UINT max) {
@@ -463,9 +701,9 @@ WIN2LIN_EXPORT LRESULT WINAPI DispatchMessageW(const MSG* msg) {
     WNDPROC wndproc = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        wndproc = g_window.wndproc;
+        auto it = g_windows.find(msg->hwnd);
+        if (it != g_windows.end()) wndproc = it->second.wndproc;
     }
-    // Route through the registered WndProc so application handlers run.
     if (wndproc) return wndproc(msg->hwnd, msg->message, msg->wParam, msg->lParam);
     return DefWindowProcW(msg->hwnd, msg->message, msg->wParam, msg->lParam);
 }
@@ -476,10 +714,21 @@ WIN2LIN_EXPORT LRESULT WINAPI DispatchMessageA(const MSG* msg) {
 
 WIN2LIN_EXPORT void WINAPI PostQuitMessage(int code) {
     USER32_INFO("PostQuitMessage(%d)", code);
+    std::lock_guard<std::mutex> lk(g_mutex);
+    MSG msg{};
+    msg.message = 0x0012; // WM_QUIT
+    msg.wParam = static_cast<WPARAM>(code);
+    g_msg_queue.push_back(msg);
 }
 
 WIN2LIN_EXPORT BOOL WINAPI PostMessageW(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
-    (void)hwnd; (void)msg; (void)w; (void)l;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    MSG m{};
+    m.hwnd = hwnd;
+    m.message = msg;
+    m.wParam = w;
+    m.lParam = l;
+    g_msg_queue.push_back(m);
     return 1;
 }
 
@@ -491,9 +740,10 @@ WIN2LIN_EXPORT LRESULT WINAPI SendMessageW(HWND hwnd, UINT msg, WPARAM w, LPARAM
     WNDPROC wndproc = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        wndproc = g_window.wndproc;
+        auto it = g_windows.find(hwnd);
+        if (it != g_windows.end()) wndproc = it->second.wndproc;
     }
-    if (wndproc && hwnd == MOCK_HWND) return wndproc(hwnd, msg, w, l);
+    if (wndproc) return wndproc(hwnd, msg, w, l);
     return 0;
 }
 
@@ -508,26 +758,27 @@ WIN2LIN_EXPORT UINT_PTR WINAPI SetTimer(HWND, UINT_PTR id, UINT, void*) {
 WIN2LIN_EXPORT BOOL WINAPI KillTimer(HWND, UINT_PTR) { return 1; }
 
 // ==========================================================================
-// Misc
+// Misc.
 // ==========================================================================
 WIN2LIN_EXPORT int WINAPI GetSystemMetrics(int index) {
-    if (index == 0) return static_cast<int>(MOCK_SCREEN_W); // SM_CXSCREEN
-    if (index == 1) return static_cast<int>(MOCK_SCREEN_H); // SM_CYSCREEN
+    if (index == 0) return static_cast<int>(MOCK_SCREEN_W);
+    if (index == 1) return static_cast<int>(MOCK_SCREEN_H);
     return 0;
 }
 
 WIN2LIN_EXPORT int WINAPI MessageBoxW(HWND, LPCWSTR text, LPCWSTR caption, UINT type) {
     (void)type;
-    USER32_INFO("MessageBoxW caption='%s' text='%s'", caption ? utf16_to_utf8(caption).c_str() : "",
+    USER32_INFO("MessageBoxW caption='%s' text='%s'",
+                caption ? utf16_to_utf8(caption).c_str() : "",
                 text ? utf16_to_utf8(text).c_str() : "");
-    return 1; // IDOK
+    return 1;
 }
 
 WIN2LIN_EXPORT int WINAPI MessageBoxA(HWND, LPCSTR text, LPCSTR caption, UINT type) {
     (void)type;
     USER32_INFO("MessageBoxA caption='%s' text='%s'", caption ? caption : "",
                 text ? text : "");
-    return 1; // IDOK
+    return 1;
 }
 
 WIN2LIN_EXPORT BOOL WINAPI SystemParametersInfoW(UINT action, UINT, PVOID pv, UINT) {

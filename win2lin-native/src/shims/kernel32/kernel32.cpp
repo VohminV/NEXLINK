@@ -1046,3 +1046,58 @@ WIN2LIN_EXPORT BOOL WINAPI GetConsoleMode(HANDLE, DWORD* mode) {
     return 1;
 }
 WIN2LIN_EXPORT BOOL WINAPI SetConsoleMode(HANDLE, DWORD) { return 1; }
+
+// ---------------------------------------------------------------------------
+// Thread / condition-variable stubs pulled in by static libstdc++.
+// ---------------------------------------------------------------------------
+WIN2LIN_EXPORT BOOL WINAPI DuplicateHandle(HANDLE, HANDLE src, HANDLE, HANDLE* dst,
+                                           DWORD, BOOL, DWORD) {
+    if (dst) *dst = src;
+    return 1;
+}
+WIN2LIN_EXPORT void WINAPI ExitThread(DWORD) { pthread_exit(nullptr); }
+WIN2LIN_EXPORT BOOL WINAPI GetExitCodeThread(HANDLE, DWORD* code) {
+    if (code) *code = 259; // STILL_ACTIVE
+    return 1;
+}
+WIN2LIN_EXPORT DWORD WINAPI GetThreadId(HANDLE) { return (DWORD)(uintptr_t)pthread_self(); }
+WIN2LIN_EXPORT DWORD WINAPI ResumeThread(HANDLE) { return 1; }
+WIN2LIN_EXPORT void WINAPI RtlVirtualUnwind(DWORD, uintptr_t, uintptr_t, void*, void*,
+                                            void*, void*, void*) {}
+WIN2LIN_EXPORT BOOL WINAPI SleepConditionVariableCS(void* cond, void* cs, DWORD ms) {
+    // Minimal: treat as a timed wait; wake after ms (or 1 ms if 0/infinite).
+    DWORD wait_ms = (ms == 0xFFFFFFFF) ? 1 : ms;
+    Sleep(wait_ms);
+    return 1;
+}
+WIN2LIN_EXPORT BOOL WINAPI SleepConditionVariableSR(void* cond, void* sr, DWORD ms) {
+    DWORD wait_ms = (ms == 0xFFFFFFFF) ? 1 : ms;
+    Sleep(wait_ms);
+    return 1;
+}
+WIN2LIN_EXPORT void WINAPI InitializeConditionVariable(void*) {}
+WIN2LIN_EXPORT void WINAPI WakeConditionVariable(void*) {}
+WIN2LIN_EXPORT void WINAPI WakeAllConditionVariable(void*) {}
+WIN2LIN_EXPORT DWORD WINAPI FormatMessageA(DWORD flags, LPCVOID source, DWORD msg_id,
+                                           DWORD lang, LPSTR buf, DWORD size,
+                                           void* args) {
+    if (buf && size > 0) buf[0] = '\0';
+    (void)flags; (void)source; (void)msg_id; (void)lang; (void)args;
+    return 0;
+}
+WIN2LIN_EXPORT void WINAPI GetSystemInfo(void* si) {
+    if (si) std::memset(si, 0, 48); // SYSTEM_INFO
+}
+WIN2LIN_EXPORT DWORD WINAPI GetTimeZoneInformation(void* tz) {
+    if (tz) std::memset(tz, 0, 172); // TIME_ZONE_INFORMATION
+    return 0; // TIME_ZONE_ID_UNKNOWN
+}
+WIN2LIN_EXPORT void* WINAPI LocalFree(void* p) { std::free(p); return nullptr; }
+WIN2LIN_EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD n,
+                                          const uintptr_t* args) {
+    (void)code; (void)flags; (void)n; (void)args;
+    std::abort();
+}
+WIN2LIN_EXPORT void WINAPI RtlCaptureContext(void* ctx) { if (ctx) std::memset(ctx, 0, 0x4D8); }
+WIN2LIN_EXPORT void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*) { return nullptr; }
+WIN2LIN_EXPORT void WINAPI RtlUnwindEx(void*, void*, void*, void*, void*, void*) {}

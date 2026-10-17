@@ -46,8 +46,8 @@ if(MINGW_CXX)
     set(WIN2LIN_GUI_TEST_PE "${FIXTURE_GUI_PE}")
 endif()
 
-# Phase 2 fixture: a D3D11 hello-triangle application.
-# Links -ld3d11 -ldxgi; static libgcc/libstdc++ keeps imports minimal.
+# Phase 4 fixture: a D3D11 textured-triangle application with a real window.
+# Links -ld3d11 -ldxgi -luser32; static libgcc/libstdc++ keeps imports minimal.
 if(MINGW_CXX)
     set(FIXTURE_D3D11_PE "${CMAKE_CURRENT_BINARY_DIR}/d3d11_triangle.exe")
     add_custom_command(
@@ -56,9 +56,9 @@ if(MINGW_CXX)
                 -Wl,--dynamicbase
                 -o "${FIXTURE_D3D11_PE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/d3d11_triangle/d3d11_triangle.cpp"
-                -ld3d11 -ldxgi
+                -ld3d11 -ldxgi -luser32
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/d3d11_triangle/d3d11_triangle.cpp"
-        COMMENT "Building D3D11 triangle PE test fixture (d3d11_triangle.exe)"
+        COMMENT "Building D3D11 textured triangle PE test fixture (d3d11_triangle.exe)"
         VERBATIM
     )
     add_custom_target(win2lin_d3d11_test_fixture ALL DEPENDS "${FIXTURE_D3D11_PE}")

@@ -260,10 +260,15 @@ int main() {
     // Mock windowing. MinGW %p prints 16 hex digits with no 0x prefix.
     check(r.out.find("RegisterClassExW -> atom=1") != std::string::npos,
           "mock RegisterClassExW returned ATOM 1");
-    check(r.out.find("CreateWindowExW -> hwnd=00000000deadbeef") != std::string::npos,
-          "mock CreateWindowExW returned 0xDEADBEEF");
+    // Phase 4: HWND is a real SDL-backed handle (non-null heap pointer).
+    {
+        const auto pos = r.out.find("CreateWindowExW -> hwnd=");
+        check(pos != std::string::npos && pos + 24 < r.out.size() &&
+                  r.out.substr(pos + 24, 16) != "0000000000000000",
+              "CreateWindowExW returned non-null HWND");
+    }
     check(r.out.find("GetClientRect -> 1920x1080") != std::string::npos,
-          "mock GetClientRect reported 1920x1080");
+          "GetClientRect reported 1920x1080");
     // DXGI skeleton. %08lX prints uppercase hex.
     check(r.out.find("CreateDXGIFactory1 -> hr=0x00000000") != std::string::npos,
           "CreateDXGIFactory1 succeeded");
