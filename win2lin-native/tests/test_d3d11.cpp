@@ -181,7 +181,8 @@ int main() {
     check(dynsym_needed(elf, "libwin_kernel32.so"), "DT_NEEDED has libwin_kernel32.so");
 
     // Validate dynsym contains D3D11 entry points.
-    check(dynsym_has(elf, "D3D11CreateDevice"), "dynsym has D3D11CreateDevice");
+    check(dynsym_has(elf, "D3D11CreateDeviceAndSwapChain"),
+          "dynsym has D3D11CreateDeviceAndSwapChain");
 
     // Execute the relinked binary.
     auto r = run_captured(elf_path, shim_dir);
@@ -189,8 +190,16 @@ int main() {
     std::cout << "exit code: " << r.code << "\n\n";
 
     // Verify results.
-    check(r.out.find("D3D11CreateDevice -> hr=0x00000000") != std::string::npos,
-          "D3D11CreateDevice returned S_OK");
+    check(r.out.find("D3D11CreateDeviceAndSwapChain -> hr=0x00000000") != std::string::npos,
+          "D3D11CreateDeviceAndSwapChain returned S_OK");
+    check(r.out.find("CreateVertexShader -> hr=0x00000000") != std::string::npos,
+          "CreateVertexShader returned S_OK (stub SPIR-V)");
+    check(r.out.find("CreatePixelShader -> hr=0x00000000") != std::string::npos,
+          "CreatePixelShader returned S_OK (stub SPIR-V)");
+    check(r.out.find("CreateInputLayout -> hr=0x00000000") != std::string::npos,
+          "CreateInputLayout returned S_OK");
+    check(r.out.find("CreateRasterizerState -> hr=0x00000000") != std::string::npos,
+          "CreateRasterizerState returned S_OK");
     check(r.out.find("CreateBuffer -> hr=0x00000000") != std::string::npos,
           "CreateBuffer returned S_OK");
     check(r.out.find("Map -> hr=0x00000000") != std::string::npos,
@@ -198,6 +207,8 @@ int main() {
     check(r.out.find("Unmap OK") != std::string::npos, "Unmap succeeded");
     check(r.out.find("Draw(3, 0) returned") != std::string::npos,
           "Draw(3, 0) executed without crash");
+    check(r.out.find("Present -> hr=0x00000000") != std::string::npos,
+          "Present returned S_OK");
     check(r.out.find("[d3d11-test] PASS") != std::string::npos, "app printed PASS");
     check(r.code == 0, "relinked D3D11 PE exits 0");
 
@@ -206,6 +217,27 @@ int main() {
           "Vulkan backend initialised");
     check(r.out.find("Created VkBuffer") != std::string::npos,
           "VkBuffer was created for ID3D11Buffer");
+    check(r.out.find("Created VkPipeline") != std::string::npos,
+          "VkPipeline was created");
+    check(r.out.find("Created VkRenderPass") != std::string::npos,
+          "VkRenderPass was created");
+    check(r.out.find("Present: wrote triangle.ppm") != std::string::npos,
+          "Present wrote triangle.ppm");
+
+    // Verify the PPM file exists and has the expected header.
+    {
+        std::string ppm_path = build_dir + "/triangle.ppm";
+        std::ifstream ppm(ppm_path, std::ios::binary);
+        check(ppm.good(), "triangle.ppm exists on disk");
+        if (ppm.good()) {
+            std::string magic;
+            ppm >> magic;
+            check(magic == "P6", "triangle.ppm is a valid P6 PPM");
+            int w = 0, h = 0;
+            ppm >> w >> h;
+            check(w == 640 && h == 480, "triangle.ppm is 640x480");
+        }
+    }
 
     std::cout << (g_checks - g_failures) << "/" << g_checks
               << " checks passed\n";

@@ -15,11 +15,13 @@
 #include "common/win32.hpp"
 #include "common/com_base.h"
 #include "vulkan_backend.h"
+#include "stub_shaders.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <vulkan/vulkan.h>
 
 using namespace win2lin::win;
 using namespace win2lin::com;
@@ -39,6 +41,15 @@ using D3D11_INPUT_CLASSIFICATION = UINT;
 using INT = int32_t;
 using UINT8 = uint8_t;
 constexpr BOOL FALSE = 0;
+
+// D3D11 state enum types (used by DESC structs below).
+using D3D11_FILL_MODE = UINT;
+using D3D11_CULL_MODE = UINT;
+using D3D11_BLEND = UINT;
+using D3D11_BLEND_OP = UINT;
+using D3D11_DEPTH_WRITE_MASK = UINT;
+using D3D11_COMPARISON_FUNC = UINT;
+using D3D11_STENCIL_OP = UINT;
 
 struct DXGI_RATIONAL { UINT Numerator; UINT Denominator; };
 struct DXGI_SAMPLE_DESC { UINT Count; UINT Quality; };
@@ -93,6 +104,46 @@ struct D3D11_INPUT_ELEMENT_DESC {
     UINT InputSlotClass;
     UINT InstanceDataStepRate;
 };
+struct D3D11_RASTERIZER_DESC {
+    D3D11_FILL_MODE FillMode;
+    D3D11_CULL_MODE CullMode;
+    BOOL FrontCounterClockwise;
+    INT DepthBias;
+    float DepthBiasClamp;
+    float SlopeScaledDepthBias;
+    BOOL DepthClipEnable;
+    BOOL ScissorEnable;
+    BOOL MultisampleEnable;
+    BOOL AntialiasedLineEnable;
+};
+struct D3D11_BLEND_DESC {
+    BOOL AlphaToCoverageEnable;
+    BOOL IndependentBlendEnable;
+    struct {
+        BOOL BlendEnable;
+        D3D11_BLEND SrcBlend;
+        D3D11_BLEND DestBlend;
+        D3D11_BLEND_OP BlendOp;
+        D3D11_BLEND SrcBlendAlpha;
+        D3D11_BLEND DestBlendAlpha;
+        D3D11_BLEND_OP BlendOpAlpha;
+        UINT8 RenderTargetWriteMask;
+    } RenderTarget[8];
+};
+struct D3D11_DEPTH_STENCIL_DESC {
+    BOOL DepthEnable;
+    D3D11_DEPTH_WRITE_MASK DepthWriteMask;
+    D3D11_COMPARISON_FUNC DepthFunc;
+    BOOL StencilEnable;
+    UINT8 StencilReadMask;
+    UINT8 StencilWriteMask;
+    struct {
+        D3D11_STENCIL_OP StencilFailOp;
+        D3D11_STENCIL_OP StencilDepthFailOp;
+        D3D11_STENCIL_OP StencilPassOp;
+        D3D11_COMPARISON_FUNC StencilFunc;
+    } FrontFace, BackFace;
+};
 
 // Enum values (subset).
 constexpr D3D_FEATURE_LEVEL D3D_FEATURE_LEVEL_11_0_ = 0xb000;
@@ -114,8 +165,22 @@ constexpr D3D11_MAP D3D11_MAP_WRITE_DISCARD_ = 4;
 constexpr UINT D3D11_SDK_VERSION_ = 7;
 constexpr UINT DXGI_FORMAT_R8G8B8A8_UNORM_ = 28;
 constexpr UINT DXGI_FORMAT_R32G32B32_FLOAT_ = 6;
+constexpr UINT DXGI_FORMAT_R32G32_FLOAT_ = 16;
+constexpr UINT DXGI_FORMAT_R32G32B32A32_FLOAT_ = 2;
 constexpr UINT D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ = 4;
 constexpr UINT D3D11_APPEND_ALIGNED_ELEMENT_ = 0xffffffff;
+
+// D3D11 state enum values.
+constexpr D3D11_FILL_MODE D3D11_FILL_SOLID_ = 3;
+constexpr D3D11_CULL_MODE D3D11_CULL_NONE_ = 1;
+constexpr D3D11_CULL_MODE D3D11_CULL_FRONT_ = 2;
+constexpr D3D11_CULL_MODE D3D11_CULL_BACK_ = 3;
+constexpr D3D11_BLEND D3D11_BLEND_ONE_ = 2;
+constexpr D3D11_BLEND D3D11_BLEND_ZERO_ = 1;
+constexpr D3D11_BLEND_OP D3D11_BLEND_OP_ADD_ = 1;
+constexpr D3D11_DEPTH_WRITE_MASK D3D11_DEPTH_WRITE_MASK_ALL_ = 1;
+constexpr D3D11_COMPARISON_FUNC D3D11_COMPARISON_ALWAYS_ = 8;
+constexpr UINT D3D11_COLOR_WRITE_ENABLE_ALL_ = 0xf;
 
 // DXGI IIDs already defined in dxgi.cpp; redeclare locally for d3d11.
 constexpr GUID IID_IDXGIAdapter_ =
@@ -157,6 +222,15 @@ constexpr GUID IID_IDXGIDevice_ =
 
 #define D3D11_UNIMPL(name) fprintf(stderr, "[NEXLINK D3D11 UNIMPL] %s\n", name)
 #define D3D11_INFO(fmt, ...) fprintf(stderr, "[NEXLINK D3D11] " fmt "\n", ##__VA_ARGS__)
+
+#define VK_CHECK_D3D11(expr)                                                    \
+    do {                                                                        \
+        VkResult _vr = (expr);                                                  \
+        if (_vr != VK_SUCCESS) {                                                \
+            D3D11_INFO("VK_CHECK failed: %s -> %d", #expr, static_cast<int>(_vr)); \
+            return false;                                                       \
+        }                                                                       \
+    } while (0)
 
 constexpr HRESULT E_FAIL_ = static_cast<HRESULT>(0x80004005LL);
 constexpr HRESULT E_OUTOFMEMORY_ = static_cast<HRESULT>(0x8007000ELL);
@@ -625,6 +699,194 @@ struct __attribute__((ms_abi)) IDXGISwapChain : public IDXGIObject {
 class MockD3D11Buffer;
 class MockD3D11DeviceContext;
 class MockD3D11Device;
+class MockD3D11InputLayout;
+class MockD3D11VertexShader;
+class MockD3D11PixelShader;
+class MockD3D11RasterizerState;
+class MockD3D11BlendState;
+class MockD3D11DepthStencilState;
+class MockDXGISwapChain;
+
+// --------------------------------------------------------------------------
+// MockD3D11InputLayout: stores D3D11 input elements + Vulkan vertex input.
+// --------------------------------------------------------------------------
+class MockD3D11InputLayout : public ComObjectBase<MockD3D11InputLayout, ID3D11InputLayout> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_ID3D11DeviceChild_)) {
+            *ppv = static_cast<ID3D11DeviceChild*>(this);
+            return true;
+        }
+        if (guid_eq(riid, IID_ID3D11InputLayout_)) {
+            *ppv = static_cast<ID3D11InputLayout*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    // Populated by CreateInputLayout.
+    std::vector<VkVertexInputBindingDescription> bindings;
+    std::vector<VkVertexInputAttributeDescription> attributes;
+};
+
+// --------------------------------------------------------------------------
+// MockD3D11VertexShader / MockD3D11PixelShader: hold SPIR-V modules.
+// --------------------------------------------------------------------------
+class MockD3D11VertexShader : public ComObjectBase<MockD3D11VertexShader, ID3D11VertexShader> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_ID3D11DeviceChild_)) {
+            *ppv = static_cast<ID3D11DeviceChild*>(this);
+            return true;
+        }
+        if (guid_eq(riid, IID_ID3D11VertexShader_)) {
+            *ppv = static_cast<ID3D11VertexShader*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    // Owned SPIR-V module (created in CreateVertexShader, destroyed in dtor).
+    VkShaderModule module = VK_NULL_HANDLE;
+    MockD3D11Device* device = nullptr;
+
+    ~MockD3D11VertexShader() {
+        if (module && device) {
+            vkDestroyShaderModule(d3d11vk::backend().device(), module, nullptr);
+        }
+    }
+};
+
+class MockD3D11PixelShader : public ComObjectBase<MockD3D11PixelShader, ID3D11PixelShader> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_ID3D11DeviceChild_)) {
+            *ppv = static_cast<ID3D11DeviceChild*>(this);
+            return true;
+        }
+        if (guid_eq(riid, IID_ID3D11PixelShader_)) {
+            *ppv = static_cast<ID3D11PixelShader*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    VkShaderModule module = VK_NULL_HANDLE;
+    MockD3D11Device* device = nullptr;
+
+    ~MockD3D11PixelShader() {
+        if (module && device) {
+            vkDestroyShaderModule(d3d11vk::backend().device(), module, nullptr);
+        }
+    }
+};
+
+// --------------------------------------------------------------------------
+// MockD3D11RasterizerState / BlendState / DepthStencilState.
+// Each holds a pre-built Vulkan pipeline state struct.
+// --------------------------------------------------------------------------
+class MockD3D11RasterizerState
+    : public ComObjectBase<MockD3D11RasterizerState, ID3D11RasterizerState> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_ID3D11DeviceChild_)) {
+            *ppv = static_cast<ID3D11DeviceChild*>(this);
+            return true;
+        }
+        if (guid_eq(riid, IID_ID3D11RasterizerState_)) {
+            *ppv = static_cast<ID3D11RasterizerState*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT;
+    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
+    VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+};
+
+class MockD3D11BlendState : public ComObjectBase<MockD3D11BlendState, ID3D11BlendState> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_ID3D11DeviceChild_)) {
+            *ppv = static_cast<ID3D11DeviceChild*>(this);
+            return true;
+        }
+        if (guid_eq(riid, IID_ID3D11BlendState_)) {
+            *ppv = static_cast<ID3D11BlendState*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    VkPipelineColorBlendStateCreateInfo blend{};
+};
+
+class MockD3D11DepthStencilState
+    : public ComObjectBase<MockD3D11DepthStencilState, ID3D11DepthStencilState> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_ID3D11DeviceChild_)) {
+            *ppv = static_cast<ID3D11DeviceChild*>(this);
+            return true;
+        }
+        if (guid_eq(riid, IID_ID3D11DepthStencilState_)) {
+            *ppv = static_cast<ID3D11DepthStencilState*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+};
+
+// --------------------------------------------------------------------------
+// MockDXGISwapChain: offscreen "swap chain" that writes a PPM on Present.
+// --------------------------------------------------------------------------
+class MockDXGISwapChain : public ComObjectBase<MockDXGISwapChain, IDXGISwapChain> {
+public:
+    bool query_extra(REFIID riid, void** ppv) {
+        if (guid_eq(riid, IID_IDXGISwapChain_)) {
+            *ppv = static_cast<IDXGISwapChain*>(this);
+            return true;
+        }
+        return false;
+    }
+
+    // IDXGISwapChain
+    HRESULT WINAPI Present(UINT SyncInterval, UINT Flags) override {
+        (void)SyncInterval;
+        (void)Flags;
+        auto& vk = d3d11vk::backend();
+        if (!vk.is_ready() || !vk.render_target().image) {
+            D3D11_INFO("Present: no render target to read back");
+            return S_OK_;
+        }
+        // Wait for any in-flight draws to finish.
+        vkDeviceWaitIdle(vk.device());
+        // Read back and write PPM.
+        bool ok = vk.readback_and_write_ppm(ppm_path_);
+        D3D11_INFO("Present: readback %s", ok ? "OK" : "FAILED");
+        return ok ? S_OK_ : E_FAIL_;
+    }
+
+    HRESULT WINAPI GetBuffer(UINT Buffer, REFIID riid, void** pp) override {
+        (void)Buffer;
+        if (pp) *pp = nullptr;
+        // Could return a texture wrapping the RT image; Phase 3: not needed.
+        D3D11_UNIMPL("IDXGISwapChain::GetBuffer");
+        return E_NOTIMPL_;
+    }
+
+    void set_ppm_path(const char* path) {
+        ppm_path_ = path ? path : "triangle.ppm";
+    }
+
+private:
+    std::string ppm_path_ = "triangle.ppm";
+};
 
 // --------------------------------------------------------------------------
 // MockD3D11Buffer: wraps a real VkBuffer + VkDeviceMemory.
@@ -699,17 +961,13 @@ public:
 
     HRESULT WINAPI GetDevice(ID3D11Device** ppDevice) override;
 
-    // ---- Draw / Map --------------------------------------------------------
-    void WINAPI Draw(UINT VertexCount, UINT StartVertexLocation) override {
-        D3D11_INFO("Draw(%u, %u)", VertexCount, StartVertexLocation);
-        draw_count_++;
-        // Phase 3 will record into a VkCommandBuffer here.
+    ~MockD3D11DeviceContext() {
+        destroy_pipeline();
     }
 
-    void WINAPI DrawIndexed(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation) override {
-        D3D11_INFO("DrawIndexed(%u, %u, %d)", IndexCount, StartIndexLocation, BaseVertexLocation);
-        draw_count_++;
-    }
+    // ---- Draw / Map --------------------------------------------------------
+    void WINAPI Draw(UINT VertexCount, UINT StartVertexLocation) override;
+    void WINAPI DrawIndexed(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation) override;
 
     HRESULT WINAPI Map(ID3D11Buffer* pBuffer, UINT, D3D11_MAP MapType, UINT,
                        D3D11_MAPPED_SUBRESOURCE* pMapped) override {
@@ -745,6 +1003,7 @@ public:
             if (pOffsets) ia_offsets_[i] = pOffsets[i];
         }
         ia_num_vertex_buffers_ = NumBuffers;
+        dirty_ = true;
     }
 
     void WINAPI IASetIndexBuffer(ID3D11Buffer* pBuffer, DXGI_FORMAT Format,
@@ -756,6 +1015,7 @@ public:
 
     void WINAPI IASetInputLayout(ID3D11InputLayout* pLayout) override {
         ia_input_layout_ = pLayout;
+        dirty_ = true;
     }
 
     void WINAPI IASetPrimitiveTopology(UINT Topology) override {
@@ -765,9 +1025,17 @@ public:
     // ---- Shader state ------------------------------------------------------
     void WINAPI VSSetShader(ID3D11VertexShader* pShader, void* const*, UINT) override {
         vs_shader_ = pShader;
+        dirty_ = true;
     }
     void WINAPI PSSetShader(ID3D11PixelShader* pShader, void* const*, UINT) override {
         ps_shader_ = pShader;
+        dirty_ = true;
+    }
+
+    // ---- Rasterizer state --------------------------------------------------
+    void WINAPI RSSetState(void* pState) override {
+        rs_state_ = static_cast<MockD3D11RasterizerState*>(pState);
+        dirty_ = true;
     }
 
     // ---- Output merger -----------------------------------------------------
@@ -776,6 +1044,16 @@ public:
         (void)NumViews;
         om_render_targets_[0] = (ppRTVs && NumViews > 0) ? ppRTVs[0] : nullptr;
         om_depth_stencil_ = pDSV;
+    }
+
+    void WINAPI OMSetBlendState(ID3D11BlendState* pBlendState, const float*, UINT) override {
+        om_blend_state_ = static_cast<MockD3D11BlendState*>(pBlendState);
+        dirty_ = true;
+    }
+
+    void WINAPI OMSetDepthStencilState(ID3D11DepthStencilState* pState, UINT) override {
+        om_depth_stencil_state_ = static_cast<MockD3D11DepthStencilState*>(pState);
+        dirty_ = true;
     }
 
     void WINAPI ClearRenderTargetView(ID3D11RenderTargetView* pRTV,
@@ -793,8 +1071,12 @@ public:
         ia_input_layout_ = nullptr;
         vs_shader_ = nullptr;
         ps_shader_ = nullptr;
+        rs_state_ = nullptr;
         om_render_targets_[0] = nullptr;
         om_depth_stencil_ = nullptr;
+        om_blend_state_ = nullptr;
+        om_depth_stencil_state_ = nullptr;
+        dirty_ = true;
     }
 
     void WINAPI Flush() override {
@@ -807,6 +1089,10 @@ public:
 
 private:
     friend class MockD3D11Device;
+
+    // Pipeline management.
+    bool ensure_pipeline();
+    void destroy_pipeline();
 
     // Input assembler state.
     ID3D11Buffer* ia_vertex_buffers_[8] = {};
@@ -823,9 +1109,19 @@ private:
     ID3D11VertexShader* vs_shader_ = nullptr;
     ID3D11PixelShader* ps_shader_ = nullptr;
 
+    // Rasterizer / blend / depth-stencil state.
+    MockD3D11RasterizerState* rs_state_ = nullptr;
+    MockD3D11BlendState* om_blend_state_ = nullptr;
+    MockD3D11DepthStencilState* om_depth_stencil_state_ = nullptr;
+
     // Output merger.
     ID3D11RenderTargetView* om_render_targets_[8] = {};
     ID3D11RenderTargetView* om_depth_stencil_ = nullptr;
+
+    // Vulkan pipeline (built lazily in Draw).
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    bool dirty_ = true;
 
     UINT draw_count_ = 0;
     MockD3D11Device* device_ = nullptr;
@@ -929,50 +1225,191 @@ public:
         return E_NOTIMPL_;
     }
 
-    HRESULT WINAPI CreateInputLayout(const D3D11_INPUT_ELEMENT_DESC*, UINT,
-                                     const void*, SIZE_T,
+    // ---- CreateInputLayout: map D3D11 elements to Vulkan vertex input ------
+    HRESULT WINAPI CreateInputLayout(const D3D11_INPUT_ELEMENT_DESC* pDesc,
+                                     UINT NumElements, const void*, SIZE_T,
                                      ID3D11InputLayout** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_UNIMPL("ID3D11Device::CreateInputLayout");
-        return E_NOTIMPL_;
+        if (!pDesc || NumElements == 0) return E_INVALIDARG_;
+
+        auto* layout = new MockD3D11InputLayout();
+
+        // Group elements by input slot to build binding descriptions.
+        // For simplicity assume one slot per element (typical for a triangle).
+        for (UINT i = 0; i < NumElements; ++i) {
+            const auto& e = pDesc[i];
+
+            // Find or create a binding for this slot.
+            VkVertexInputBindingDescription* binding = nullptr;
+            for (auto& b : layout->bindings) {
+                if (b.binding == e.InputSlot) {
+                    binding = &b;
+                    break;
+                }
+            }
+            if (!binding) {
+                layout->bindings.push_back(
+                    {e.InputSlot, 0, VK_VERTEX_INPUT_RATE_VERTEX});
+                binding = &layout->bindings.back();
+            }
+
+            // Compute format + size.
+            VkFormat fmt = VK_FORMAT_R32G32B32_SFLOAT;
+            uint32_t fmt_size = 12;
+            if (e.Format == DXGI_FORMAT_R32G32_FLOAT_) {
+                fmt = VK_FORMAT_R32G32_SFLOAT;
+                fmt_size = 8;
+            } else if (e.Format == DXGI_FORMAT_R32G32B32A32_FLOAT_) {
+                fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
+                fmt_size = 16;
+            }
+
+            uint32_t offset = e.AlignedByteOffset;
+            if (offset == D3D11_APPEND_ALIGNED_ELEMENT_) {
+                offset = binding->stride;
+            }
+            binding->stride += fmt_size;
+
+            layout->attributes.push_back(
+                {i, e.InputSlot, fmt, offset});
+        }
+
+        *pp = static_cast<ID3D11InputLayout*>(layout);
+        D3D11_INFO("CreateInputLayout: %u elements, %zu bindings, %zu attrs",
+                   NumElements, layout->bindings.size(), layout->attributes.size());
+        return S_OK_;
     }
 
-    HRESULT WINAPI CreateVertexShader(const void*, SIZE_T, void*,
-                                      ID3D11VertexShader** pp) override {
+    // ---- CreateVertexShader: ignore DXBC, return stub SPIR-V ----------------
+    HRESULT WINAPI CreateVertexShader(const void* pShaderBytecode, SIZE_T BytecodeLength,
+                                      void*, ID3D11VertexShader** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_UNIMPL("ID3D11Device::CreateVertexShader");
-        return E_NOTIMPL_;
+        D3D11_INFO("CreateVertexShader called with %zu bytes of DXBC (using stub SPIR-V)",
+                   static_cast<size_t>(BytecodeLength));
+
+        auto* shader = new MockD3D11VertexShader();
+        shader->device = this;
+
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = sizeof(d3d11vk::kStubVertexShaderSpv);
+        ci.pCode = d3d11vk::kStubVertexShaderSpv;
+        if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
+                                 &shader->module) != VK_SUCCESS) {
+            delete shader;
+            return E_FAIL_;
+        }
+
+        *pp = static_cast<ID3D11VertexShader*>(shader);
+        D3D11_INFO("Created stub VkShaderModule %p for ID3D11VertexShader %p",
+                   static_cast<void*>(shader->module), static_cast<void*>(shader));
+        return S_OK_;
     }
 
-    HRESULT WINAPI CreatePixelShader(const void*, SIZE_T, void*,
-                                     ID3D11PixelShader** pp) override {
+    // ---- CreatePixelShader: ignore DXBC, return stub SPIR-V -----------------
+    HRESULT WINAPI CreatePixelShader(const void* pShaderBytecode, SIZE_T BytecodeLength,
+                                     void*, ID3D11PixelShader** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_UNIMPL("ID3D11Device::CreatePixelShader");
-        return E_NOTIMPL_;
+        D3D11_INFO("CreatePixelShader called with %zu bytes of DXBC (using stub SPIR-V)",
+                   static_cast<size_t>(BytecodeLength));
+
+        auto* shader = new MockD3D11PixelShader();
+        shader->device = this;
+
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = sizeof(d3d11vk::kStubPixelShaderSpv);
+        ci.pCode = d3d11vk::kStubPixelShaderSpv;
+        if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
+                                 &shader->module) != VK_SUCCESS) {
+            delete shader;
+            return E_FAIL_;
+        }
+
+        *pp = static_cast<ID3D11PixelShader*>(shader);
+        D3D11_INFO("Created stub VkShaderModule %p for ID3D11PixelShader %p",
+                   static_cast<void*>(shader->module), static_cast<void*>(shader));
+        return S_OK_;
     }
 
-    HRESULT WINAPI CreateRasterizerState(const void*, ID3D11RasterizerState** pp) override {
+    // ---- CreateRasterizerState ----------------------------------------------
+    HRESULT WINAPI CreateRasterizerState(const void* pDesc,
+                                         ID3D11RasterizerState** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_UNIMPL("ID3D11Device::CreateRasterizerState");
-        return E_NOTIMPL_;
+        auto* state = new MockD3D11RasterizerState();
+
+        if (pDesc) {
+            const auto* d = static_cast<const D3D11_RASTERIZER_DESC*>(pDesc);
+            state->raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            state->raster.polygonMode =
+                (d->FillMode == D3D11_FILL_SOLID_) ? VK_POLYGON_MODE_FILL
+                                                   : VK_POLYGON_MODE_LINE;
+            state->raster.cullMode =
+                (d->CullMode == D3D11_CULL_NONE_)   ? VK_CULL_MODE_NONE
+                : (d->CullMode == D3D11_CULL_FRONT_) ? VK_CULL_MODE_FRONT_BIT
+                                                     : VK_CULL_MODE_BACK_BIT;
+            state->raster.frontFace = d->FrontCounterClockwise
+                                          ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                          : VK_FRONT_FACE_CLOCKWISE;
+            state->raster.depthClampEnable = VK_FALSE;
+            state->raster.depthBiasEnable = VK_FALSE;
+            state->raster.lineWidth = 1.0f;
+        } else {
+            // Defaults.
+            state->raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            state->raster.polygonMode = VK_POLYGON_MODE_FILL;
+            state->raster.cullMode = VK_CULL_MODE_BACK_BIT;
+            state->raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            state->raster.lineWidth = 1.0f;
+        }
+
+        *pp = static_cast<ID3D11RasterizerState*>(state);
+        D3D11_INFO("Created ID3D11RasterizerState %p", static_cast<void*>(state));
+        return S_OK_;
     }
 
-    HRESULT WINAPI CreateBlendState(const void*, ID3D11BlendState** pp) override {
+    // ---- CreateBlendState ----------------------------------------------------
+    HRESULT WINAPI CreateBlendState(const void* pDesc,
+                                    ID3D11BlendState** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_UNIMPL("ID3D11Device::CreateBlendState");
-        return E_NOTIMPL_;
+        auto* state = new MockD3D11BlendState();
+
+        state->blend_attachment.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        state->blend_attachment.blendEnable = VK_FALSE;
+        state->blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        state->blend.logicOpEnable = VK_FALSE;
+        state->blend.attachmentCount = 1;
+        state->blend.pAttachments = &state->blend_attachment;
+
+        (void)pDesc; // use defaults for now
+        *pp = static_cast<ID3D11BlendState*>(state);
+        D3D11_INFO("Created ID3D11BlendState %p", static_cast<void*>(state));
+        return S_OK_;
     }
 
-    HRESULT WINAPI CreateDepthStencilState(const void*, ID3D11DepthStencilState** pp) override {
+    // ---- CreateDepthStencilState ----------------------------------------------
+    HRESULT WINAPI CreateDepthStencilState(const void* pDesc,
+                                           ID3D11DepthStencilState** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_UNIMPL("ID3D11Device::CreateDepthStencilState");
-        return E_NOTIMPL_;
+        auto* state = new MockD3D11DepthStencilState();
+
+        state->depth_stencil.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        state->depth_stencil.depthTestEnable = VK_FALSE;
+        state->depth_stencil.depthWriteEnable = VK_FALSE;
+        state->depth_stencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        state->depth_stencil.stencilTestEnable = VK_FALSE;
+
+        (void)pDesc;
+        *pp = static_cast<ID3D11DepthStencilState*>(state);
+        D3D11_INFO("Created ID3D11DepthStencilState %p", static_cast<void*>(state));
+        return S_OK_;
     }
 
     HRESULT WINAPI CreateSamplerState(const void*, ID3D11SamplerState** pp) override {
@@ -1033,6 +1470,237 @@ HRESULT WINAPI MockD3D11DeviceContext::GetDevice(ID3D11Device** ppDevice) {
     }
     *ppDevice = nullptr;
     return E_POINTER_;
+}
+
+// --------------------------------------------------------------------------
+// Pipeline management (lazy build in Draw).
+// --------------------------------------------------------------------------
+void MockD3D11DeviceContext::destroy_pipeline() {
+    VkDevice dev = d3d11vk::backend().device();
+    if (pipeline_) {
+        vkDestroyPipeline(dev, pipeline_, nullptr);
+        pipeline_ = VK_NULL_HANDLE;
+    }
+    if (pipeline_layout_) {
+        vkDestroyPipelineLayout(dev, pipeline_layout_, nullptr);
+        pipeline_layout_ = VK_NULL_HANDLE;
+    }
+}
+
+bool MockD3D11DeviceContext::ensure_pipeline() {
+    if (pipeline_ && !dirty_) return true;
+    if (pipeline_) destroy_pipeline();
+
+    auto& vk = d3d11vk::backend();
+    VkDevice dev = vk.device();
+    if (!dev) return false;
+
+    // Ensure render target + render pass + framebuffer exist.
+    if (!vk.render_target().image) {
+        // Default 640x480 if no swap chain was created.
+        if (!vk.create_render_target(640, 480, VK_FORMAT_B8G8R8A8_UNORM))
+            return false;
+    }
+    if (!vk.ensure_render_pass()) return false;
+    if (!vk.ensure_framebuffer()) return false;
+
+    // ---- Pipeline layout (empty for now; no descriptors yet) --------------
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VK_CHECK_D3D11(vkCreatePipelineLayout(dev, &plci, nullptr, &pipeline_layout_));
+
+    // ---- Shader stages -----------------------------------------------------
+    auto* vs = static_cast<MockD3D11VertexShader*>(vs_shader_);
+    auto* ps = static_cast<MockD3D11PixelShader*>(ps_shader_);
+    if (!vs || !ps || !vs->module || !ps->module) {
+        D3D11_INFO("ensure_pipeline: missing shader modules");
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs->module;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps->module;
+    stages[1].pName = "main";
+
+    // ---- Vertex input (from input layout) ---------------------------------
+    auto* layout = static_cast<MockD3D11InputLayout*>(ia_input_layout_);
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    if (layout) {
+        vertex_input.vertexBindingDescriptionCount =
+            static_cast<uint32_t>(layout->bindings.size());
+        vertex_input.pVertexBindingDescriptions = layout->bindings.data();
+        vertex_input.vertexAttributeDescriptionCount =
+            static_cast<uint32_t>(layout->attributes.size());
+        vertex_input.pVertexAttributeDescriptions = layout->attributes.data();
+    }
+
+    // ---- Input assembly ----------------------------------------------------
+    VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    // ---- Viewport / scissor (dynamic, full render target) ------------------
+    VkPipelineViewportStateCreateInfo viewport{};
+    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+
+    // ---- Rasterizer state --------------------------------------------------
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_BACK_BIT;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    if (rs_state_) {
+        raster = rs_state_->raster;
+        raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        raster.lineWidth = 1.0f; // Vulkan requires >= 1.0
+    }
+
+    // ---- Multisample -------------------------------------------------------
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // ---- Depth / stencil ---------------------------------------------------
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_FALSE;
+    depth_stencil.depthWriteEnable = VK_FALSE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    depth_stencil.stencilTestEnable = VK_FALSE;
+    if (om_depth_stencil_state_) {
+        depth_stencil = om_depth_stencil_state_->depth_stencil;
+        depth_stencil.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    }
+
+    // ---- Color blend -------------------------------------------------------
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blend_attachment.blendEnable = VK_FALSE;
+    if (om_blend_state_) {
+        blend_attachment = om_blend_state_->blend_attachment;
+    }
+
+    VkPipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    color_blend.logicOpEnable = VK_FALSE;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend_attachment;
+
+    // ---- Dynamic states (viewport + scissor) --------------------------------
+    VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                       VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+
+    // ---- Graphics pipeline --------------------------------------------------
+    VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpci.stageCount = 2;
+    gpci.pStages = stages;
+    gpci.pVertexInputState = &vertex_input;
+    gpci.pInputAssemblyState = &input_assembly;
+    gpci.pViewportState = &viewport;
+    gpci.pRasterizationState = &raster;
+    gpci.pMultisampleState = &multisample;
+    gpci.pDepthStencilState = &depth_stencil;
+    gpci.pColorBlendState = &color_blend;
+    gpci.pDynamicState = &dynamic;
+    gpci.layout = pipeline_layout_;
+    gpci.renderPass = vk.render_pass();
+    gpci.subpass = 0;
+
+    VK_CHECK_D3D11(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr,
+                                       &pipeline_));
+    dirty_ = false;
+    D3D11_INFO("Created VkPipeline %p (dirty reset)",
+               static_cast<void*>(pipeline_));
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// Draw: build pipeline if needed, record command buffer, submit.
+// --------------------------------------------------------------------------
+void MockD3D11DeviceContext::Draw(UINT VertexCount, UINT StartVertexLocation) {
+    D3D11_INFO("Draw(%u, %u)", VertexCount, StartVertexLocation);
+    draw_count_++;
+
+    auto& vk = d3d11vk::backend();
+    VkDevice dev = vk.device();
+    if (!dev) return;
+
+    if (!ensure_pipeline()) {
+        D3D11_INFO("Draw: pipeline creation failed");
+        return;
+    }
+
+    // Allocate a one-shot command buffer.
+    VkCommandBuffer cmd = vk.begin_one_shot();
+    if (!cmd) {
+        D3D11_INFO("Draw: begin_one_shot failed");
+        return;
+    }
+
+    // Begin render pass with a dark clear color.
+    VkClearValue clear{};
+    clear.color = {{0.1f, 0.1f, 0.1f, 1.0f}};
+    VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rpbi.renderPass = vk.render_pass();
+    rpbi.framebuffer = vk.framebuffer();
+    rpbi.renderArea = {{0, 0}, {vk.render_target().width, vk.render_target().height}};
+    rpbi.clearValueCount = 1;
+    rpbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Viewport + scissor (full RT).
+    VkViewport vp{};
+    vp.x = 0;
+    vp.y = 0;
+    vp.width = static_cast<float>(vk.render_target().width);
+    vp.height = static_cast<float>(vk.render_target().height);
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0},
+                     {vk.render_target().width, vk.render_target().height}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Bind pipeline.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+
+    // Bind vertex buffer(s).
+    if (ia_num_vertex_buffers_ > 0 && ia_vertex_buffers_[0]) {
+        auto* vbuf = static_cast<MockD3D11Buffer*>(ia_vertex_buffers_[0]);
+        VkBuffer vk_buf = vbuf->vk().buffer;
+        VkDeviceSize offset = ia_offsets_[0];
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vk_buf, &offset);
+    }
+
+    // Draw.
+    vkCmdDraw(cmd, VertexCount, 1, StartVertexLocation, 0);
+    vkCmdEndRenderPass(cmd);
+    vk.end_one_shot(cmd);
+
+    D3D11_INFO("Draw(%u): recorded and submitted VkCommandBuffer", VertexCount);
+}
+
+void MockD3D11DeviceContext::DrawIndexed(UINT IndexCount, UINT StartIndexLocation,
+                                         INT BaseVertexLocation) {
+    D3D11_INFO("DrawIndexed(%u, %u, %d)", IndexCount, StartIndexLocation,
+               BaseVertexLocation);
+    // Phase 3: treat like Draw for now (no index buffer binding yet).
+    Draw(IndexCount, 0);
 }
 
 // --------------------------------------------------------------------------
@@ -1099,7 +1767,6 @@ WIN2LIN_EXPORT HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     (void)pFeatureLevels;
     (void)FeatureLevels;
     (void)SDKVersion;
-    (void)pSwapChainDesc;
 
     D3D11_INFO("D3D11CreateDeviceAndSwapChain(adapter=%p, driverType=%u)",
                pAdapter, DriverType);
@@ -1109,10 +1776,25 @@ WIN2LIN_EXPORT HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     if (FAILED(hr)) return hr;
     if (SUCCEEDED(hr) && pFeatureLevel) *pFeatureLevel = D3D_FEATURE_LEVEL_11_0_;
 
-    // Phase 2: swap chain is a stub (no VkSwapchainKHR yet).
+    // Create the offscreen render target matching the swap chain description.
+    uint32_t width = 640, height = 480;
+    if (pSwapChainDesc) {
+        if (pSwapChainDesc->BufferDesc.Width) width = pSwapChainDesc->BufferDesc.Width;
+        if (pSwapChainDesc->BufferDesc.Height) height = pSwapChainDesc->BufferDesc.Height;
+    }
+    auto& vk = d3d11vk::backend();
+    if (!vk.render_target().image) {
+        if (!vk.create_render_target(width, height, VK_FORMAT_B8G8R8A8_UNORM)) {
+            fprintf(stderr, "[NEXLINK D3D11] swap chain render target failed\n");
+        }
+    }
+
     if (ppSwapChain) {
-        *ppSwapChain = nullptr;
-        D3D11_UNIMPL("D3D11CreateDeviceAndSwapChain (swap chain stub)");
+        auto* sc = new MockDXGISwapChain();
+        sc->set_ppm_path("triangle.ppm");
+        *ppSwapChain = static_cast<IDXGISwapChain*>(sc);
+        D3D11_INFO("Created MockDXGISwapChain %p (%ux%u)",
+                   static_cast<void*>(sc), width, height);
     }
     return hr;
 }

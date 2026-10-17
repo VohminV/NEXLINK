@@ -35,9 +35,13 @@ namespace {
 VulkanBackend::~VulkanBackend() {
     if (device_) {
         vkDeviceWaitIdle(device_);
+        destroy_render_target();
+        if (framebuffer_) vkDestroyFramebuffer(device_, framebuffer_, nullptr);
+        if (render_pass_) vkDestroyRenderPass(device_, render_pass_, nullptr);
         if (cmd_pool_) vkDestroyCommandPool(device_, cmd_pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
+    if (headless_surface_) vkDestroySurfaceKHR(instance_, headless_surface_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
 }
 
@@ -304,6 +308,242 @@ void VulkanBackend::end_one_shot(VkCommandBuffer cmd) {
     vkQueueSubmit(graphics_queue_, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(graphics_queue_);
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+}
+
+// ---------------------------------------------------------------------------
+// Offscreen render target (swap chain substitute)
+// ---------------------------------------------------------------------------
+bool VulkanBackend::create_render_target(uint32_t width, uint32_t height,
+                                         VkFormat format) {
+    if (!ready_) return false;
+    destroy_render_target();
+
+    // ---- VkImage ----------------------------------------------------------
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = format;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(device_, &ici, nullptr, &rt_.image));
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, rt_.image, &req);
+    uint32_t type_idx = find_memory_type(
+        req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (type_idx == UINT32_MAX)
+        type_idx = find_memory_type(req.memoryTypeBits,
+                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type_idx == UINT32_MAX) {
+        fprintf(stderr, "[NEXLINK D3D11] no memory type for render target\n");
+        return false;
+    }
+
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type_idx;
+    VK_CHECK(vkAllocateMemory(device_, &mai, nullptr, &rt_.memory));
+    VK_CHECK(vkBindImageMemory(device_, rt_.image, rt_.memory, 0));
+
+    // ---- VkImageView -------------------------------------------------------
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = rt_.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device_, &vci, nullptr, &rt_.view));
+
+    rt_.width = width;
+    rt_.height = height;
+    rt_.format = format;
+
+    // Framebuffer depends on the render pass + this view; destroy stale one.
+    if (framebuffer_) {
+        vkDestroyFramebuffer(device_, framebuffer_, nullptr);
+        framebuffer_ = VK_NULL_HANDLE;
+    }
+
+    fprintf(stderr, "[NEXLINK D3D11] Created render target %ux%u (VkImage %p)\n",
+            width, height, static_cast<void*>(rt_.image));
+    return true;
+}
+
+void VulkanBackend::destroy_render_target() {
+    if (!device_) return;
+    if (rt_.view) vkDestroyImageView(device_, rt_.view, nullptr);
+    if (rt_.image) vkDestroyImage(device_, rt_.image, nullptr);
+    if (rt_.memory) vkFreeMemory(device_, rt_.memory, nullptr);
+    rt_ = {};
+}
+
+// ---------------------------------------------------------------------------
+// Render pass
+// ---------------------------------------------------------------------------
+bool VulkanBackend::ensure_render_pass() {
+    if (render_pass_) return true;
+    if (!ready_ || rt_.format == VK_FORMAT_UNDEFINED) return false;
+
+    VkAttachmentDescription color{};
+    color.format = rt_.format;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref{};
+    color_ref.attachment = 0;
+    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &color;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &subpass;
+    rpci.dependencyCount = 1;
+    rpci.pDependencies = &dep;
+    VK_CHECK(vkCreateRenderPass(device_, &rpci, nullptr, &render_pass_));
+    fprintf(stderr, "[NEXLINK D3D11] Created VkRenderPass %p (format=%d)\n",
+            static_cast<void*>(render_pass_), static_cast<int>(rt_.format));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Framebuffer
+// ---------------------------------------------------------------------------
+bool VulkanBackend::ensure_framebuffer() {
+    if (framebuffer_) return true;
+    if (!render_pass_ || !rt_.view) return false;
+
+    VkImageView attachments[] = {rt_.view};
+    VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = render_pass_;
+    fci.attachmentCount = 1;
+    fci.pAttachments = attachments;
+    fci.width = rt_.width;
+    fci.height = rt_.height;
+    fci.layers = 1;
+    VK_CHECK(vkCreateFramebuffer(device_, &fci, nullptr, &framebuffer_));
+    fprintf(stderr, "[NEXLINK D3D11] Created VkFramebuffer %p (%ux%u)\n",
+            static_cast<void*>(framebuffer_), rt_.width, rt_.height);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Readback: copy the RT image to a host-visible buffer and write a PPM.
+// ---------------------------------------------------------------------------
+bool VulkanBackend::readback_and_write_ppm(const std::string& path) {
+    if (!ready_ || !rt_.image) return false;
+
+    const uint32_t w = rt_.width;
+    const uint32_t h = rt_.height;
+    const VkDeviceSize buf_size = static_cast<VkDeviceSize>(w) * h * 4;
+
+    // Host-visible staging buffer.
+    VulkanBuffer staging{};
+    if (!create_buffer(buf_size,
+                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                       &staging)) {
+        fprintf(stderr, "[NEXLINK D3D11] readback: staging buffer alloc failed\n");
+        return false;
+    }
+
+    VkCommandBuffer cmd = begin_one_shot();
+    if (!cmd) {
+        destroy_buffer(&staging);
+        return false;
+    }
+
+    // Transition image: COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL.
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = rt_.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Copy image -> buffer.
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd, rt_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           staging.buffer, 1, &region);
+
+    // Transition back for next frame.
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    end_one_shot(cmd);
+
+    // Map and write PPM (P6 binary).
+    void* pixels = map_buffer(&staging);
+    if (!pixels) {
+        destroy_buffer(&staging);
+        return false;
+    }
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "[NEXLINK D3D11] readback: cannot open %s\n", path.c_str());
+        unmap_buffer(&staging);
+        destroy_buffer(&staging);
+        return false;
+    }
+    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+    // Vulkan RGBA -> PPM RGB (drop alpha).
+    const auto* src = static_cast<const uint8_t*>(pixels);
+    for (uint32_t i = 0; i < w * h; ++i) {
+        std::fputc(src[i * 4 + 0], f); // R
+        std::fputc(src[i * 4 + 1], f); // G
+        std::fputc(src[i * 4 + 2], f); // B
+    }
+    std::fclose(f);
+    unmap_buffer(&staging);
+    destroy_buffer(&staging);
+
+    fprintf(stderr, "[NEXLINK D3D11] Present: wrote %s (%ux%u)\n",
+            path.c_str(), w, h);
+    return true;
 }
 
 VulkanBackend& backend() {

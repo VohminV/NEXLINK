@@ -7,14 +7,19 @@
 //   * Provide headless presentation (VK_EXT_headless_surface) so we can
 //     exercise the full D3D11 path without a real X11/Wayland window.
 //   * Allocate VkBuffer + VkDeviceMemory for D3D11 buffers with correct
-//     memory-type selection (host-visible for DYNAMIC/CPU_ACCESS_WRITE).
+//     memory-type selection (host-visible for DYNAMIC / CPU_ACCESS_WRITE).
+//   * Manage the "swap chain" as an offscreen VkImage + VkImageView that
+//     Present() reads back into a host-visible buffer and writes to disk.
+//   * Create VkRenderPass / VkFramebuffer / VkPipeline for the triangle.
 //
 // All public methods are SysV-ABI (this is Linux-side infrastructure, not
 // called from the PE).  The D3D11 shim (ms_abi) calls into this.
 
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -27,6 +32,16 @@ struct VulkanBuffer {
     VkDeviceSize size = 0;
     void* mapped = nullptr; // non-null only for HOST_VISIBLE buffers
     uint32_t memory_type = 0;
+};
+
+// Offscreen "swap chain" target: a color attachment image + view.
+struct VulkanRenderTarget {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
 };
 
 class VulkanBackend {
@@ -47,27 +62,49 @@ public:
     VkDevice device() const { return device_; }
     VkQueue graphics_queue() const { return graphics_queue_; }
     uint32_t graphics_queue_family() const { return graphics_queue_family_; }
+    VkCommandPool command_pool() const { return cmd_pool_; }
+    VkFormat swapchain_format() const { return rt_.format; }
 
-    // Create a buffer with the given Vulkan usage / memory properties.
-    // Returns false on failure (details logged to stderr).
+    // ---- Buffers -----------------------------------------------------------
     bool create_buffer(VkDeviceSize size,
                        VkBufferUsageFlags usage,
                        VkMemoryPropertyFlags mem_props,
                        VulkanBuffer* out);
-
-    // Destroy a buffer created by create_buffer().
     void destroy_buffer(VulkanBuffer* buf);
-
-    // Map / unmap a host-visible buffer.
     void* map_buffer(VulkanBuffer* buf);
     void unmap_buffer(VulkanBuffer* buf);
 
-    // Command buffer helpers (one-shot submit).
+    // ---- Offscreen render target (swap chain substitute) -------------------
+    // Creates a VkImage + VkImageView of the requested size / format.
+    bool create_render_target(uint32_t width, uint32_t height, VkFormat format);
+    VulkanRenderTarget& render_target() { return rt_; }
+    const VulkanRenderTarget& render_target() const { return rt_; }
+
+    // ---- Render pass --------------------------------------------------------
+    // Single color attachment, loadOp from clear color, storeOp = STORE.
+    // Created lazily on first ensure_render_pass() call.
+    VkRenderPass render_pass() const { return render_pass_; }
+    bool ensure_render_pass();
+
+    // ---- Framebuffer --------------------------------------------------------
+    // Bound to the current render target.  Recreated if RT changes size.
+    VkFramebuffer framebuffer() const { return framebuffer_; }
+    bool ensure_framebuffer();
+
+    // ---- Graphics pipeline ---------------------------------------------------
+    // The pipeline is owned by the caller (context) and built from D3D11
+    // state.  This helper just exposes the render pass / format it needs.
+    VkFormat color_attachment_format() const { return rt_.format; }
+
+    // ---- Readback ------------------------------------------------------------
+    // Transition the RT image to TRANSFER_SRC, copy to a host-visible buffer,
+    // map it, and write a PPM file.  Returns true on success.
+    bool readback_and_write_ppm(const std::string& path);
+
+    // ---- One-shot command helpers --------------------------------------------
     VkCommandBuffer begin_one_shot();
     void end_one_shot(VkCommandBuffer cmd);
 
-    // Find a memory type index matching the required properties.
-    // Returns UINT32_MAX if none found.
     uint32_t find_memory_type(uint32_t type_bits,
                               VkMemoryPropertyFlags props) const;
 
@@ -75,6 +112,7 @@ private:
     bool create_instance();
     bool pick_physical_device();
     bool create_device();
+    void destroy_render_target();
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
@@ -84,6 +122,16 @@ private:
     VkPhysicalDeviceMemoryProperties mem_props_{};
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
     bool ready_ = false;
+
+    // Headless surface (optional).
+    VkSurfaceKHR headless_surface_ = VK_NULL_HANDLE;
+
+    // Offscreen render target.
+    VulkanRenderTarget rt_{};
+
+    // Render pass + framebuffer.
+    VkRenderPass render_pass_ = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
 };
 
 // Process-wide singleton (thread-safe lazy init).
