@@ -524,10 +524,30 @@ bool PeToElfConverter::generate_elf() {
         uint32_t sym;
     };
     std::vector<GlobDat> glob_dats;
+    // Memory allocation functions exported by the msvcrt shim use the ms_abi
+    // calling convention. If the PE's dynsym entries used the plain names
+    // (malloc/realloc/free), other SysV libraries loaded into the process
+    // (e.g. the NVIDIA Vulkan ICD) would resolve their own unversioned
+    // references to our ms_abi shims, passing RDI/RSI where we expect
+    // RCX/RDX — silently corrupting the heap. Prefix those symbols so only
+    // the PE's own GLOB_DAT relocations bind to the ms_abi versions.
+    static const std::map<std::string, std::string> kAbiSensitivePrefix = {
+        {"malloc", "_win2lin_malloc"},
+        {"realloc", "_win2lin_realloc"},
+        {"free", "_win2lin_free"},
+        {"calloc", "_win2lin_calloc"},
+    };
     for (const PeImportSlot& imp : imports_) {
         std::string name = imp.func.empty()
                                ? ordinal_symbol(dll_stem(imp.dll), imp.ordinal)
                                : imp.func;
+        // Only apply the rename for msvcrt imports (the shim that exports
+        // ms_abi memory functions). Other DLLs keep their original names.
+        const std::string stem = dll_stem(imp.dll);
+        if (stem == "msvcrt" || stem == "ucrtbase" || stem == "msvcrt_d") {
+            auto it = kAbiSensitivePrefix.find(name);
+            if (it != kAbiSensitivePrefix.end()) name = it->second;
+        }
         const uint32_t idx = intern_symbol(name);
         glob_dats.push_back({imp.iat_rva, idx});
     }

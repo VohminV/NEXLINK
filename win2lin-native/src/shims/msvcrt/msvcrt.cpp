@@ -865,31 +865,40 @@ WIN2LIN_EXPORT char*** WINAPI __p__environ(void) {
 
 // ==========================================================================
 // Heap
+//
+// The ms_abi entry points are exported under the _win2lin_ prefix. The
+// relinker rewrites the PE's msvcrt imports of malloc/realloc/free/calloc
+// to GLOB_DAT relocations against these prefixed names, so only the PE's
+// own IAT slots bind to the ms_abi versions. The unprefixed names are NOT
+// exported: any other library in the process (e.g. the NVIDIA Vulkan ICD)
+// that references malloc/realloc/free will resolve them against glibc's
+// real SysV implementations, not our ms_abi shims.
 // ==========================================================================
-WIN2LIN_EXPORT void* WINAPI malloc(size_t size) {
+WIN2LIN_EXPORT void* WINAPI _win2lin_malloc(size_t size) {
     ensure_crt();
     return g_glibc.malloc(size ? size : 1);
 }
-WIN2LIN_EXPORT void* WINAPI calloc(size_t n, size_t size) {
+WIN2LIN_EXPORT void* WINAPI _win2lin_calloc(size_t n, size_t size) {
     ensure_crt();
     return g_glibc.calloc(n ? n : 1, size ? size : 1);
 }
-WIN2LIN_EXPORT void* WINAPI realloc(void* p, size_t size) {
+WIN2LIN_EXPORT void* WINAPI _win2lin_realloc(void* p, size_t size) {
     ensure_crt();
     return g_glibc.realloc(p, size ? size : 1);
 }
-WIN2LIN_EXPORT void WINAPI free(void* p) {
+WIN2LIN_EXPORT void WINAPI _win2lin_free(void* p) {
     ensure_crt();
     g_glibc.free(p);
 }
+
 WIN2LIN_EXPORT size_t WINAPI _msize(void* p) {
     ensure_crt();
     return p ? g_glibc.malloc_usable_size(p) : 0;
 }
-WIN2LIN_EXPORT void* WINAPI _malloc_base(size_t size) { return malloc(size); }
-WIN2LIN_EXPORT void* WINAPI _calloc_base(size_t n, size_t size) { return calloc(n, size); }
-WIN2LIN_EXPORT void* WINAPI _realloc_base(void* p, size_t size) { return realloc(p, size); }
-WIN2LIN_EXPORT void WINAPI _free_base(void* p) { free(p); }
+WIN2LIN_EXPORT void* WINAPI _malloc_base(size_t size) { return _win2lin_malloc(size); }
+WIN2LIN_EXPORT void* WINAPI _calloc_base(size_t n, size_t size) { return _win2lin_calloc(n, size); }
+WIN2LIN_EXPORT void* WINAPI _realloc_base(void* p, size_t size) { return _win2lin_realloc(p, size); }
+WIN2LIN_EXPORT void WINAPI _free_base(void* p) { _win2lin_free(p); }
 
 // ==========================================================================
 // Memory / string primitives (thin glibc passthroughs)
