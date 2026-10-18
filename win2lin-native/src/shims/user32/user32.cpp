@@ -312,26 +312,22 @@ WIN2LIN_EXPORT HWND WINAPI CreateWindowExW(DWORD ex_style, LPCWSTR class_name,
     }
 
     const int win_w = (width <= 0 || width == static_cast<int>(0x80000000))
-                          ? MOCK_SCREEN_W
+                          ? 1280  // Default smaller than full-screen to avoid smart-placement
                           : width;
     const int win_h = (height <= 0 || height == static_cast<int>(0x80000000))
-                          ? MOCK_SCREEN_H
+                          ? 720   // Default smaller than full-screen
                           : height;
-    const int win_x = (x == static_cast<int>(0x80000000)) ? 0 : x;
-    const int win_y = (y == static_cast<int>(0x80000000)) ? 0 : y;
+    const int win_x = 0;
+    const int win_y = 0;
 
     const std::string title = window_name ? utf16_to_utf8(window_name) : "NEXLINK";
 
     void* sdl_win = nullptr;
     if (ensure_sdl()) {
-        // Prefer a Vulkan-capable window so D3D11 can create a real surface.
+        // Prefer a window without VULKAN flag to avoid window manager issues.
         Uint32 sdl_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
         SDL_Window* w = SDL_CreateWindow(title.c_str(), win_x, win_y, win_w, win_h,
-                                         sdl_flags | SDL_WINDOW_VULKAN);
-        if (!w) {
-            USER32_INFO("SDL_CreateWindow(VULKAN) failed: %s; retrying without", SDL_GetError());
-            w = SDL_CreateWindow(title.c_str(), win_x, win_y, win_w, win_h, sdl_flags);
-        }
+                                         sdl_flags);
         if (w) {
             sdl_win = w;
             int rw = 0, rh = 0;
@@ -354,6 +350,19 @@ WIN2LIN_EXPORT HWND WINAPI CreateWindowExW(DWORD ex_style, LPCWSTR class_name,
     info.style = style;
     info.visible = false;
     info.wndproc = wndproc;
+    // Auto-show the window so games that forget ShowWindow still display.
+    if (sdl_win) {
+        auto* sdl_w = static_cast<SDL_Window*>(sdl_win);
+        // Force onto primary monitor at a reasonable size to avoid
+        // window-manager smart-placement on multi-monitor setups.
+        SDL_SetWindowPosition(sdl_w, 0, 0);
+        if (win_w > 1280 || win_h > 720) {
+            SDL_SetWindowSize(sdl_w, 1280, 720);
+        }
+        SDL_ShowWindow(sdl_w);
+        SDL_RaiseWindow(sdl_w);
+        info.visible = true;
+    }
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         g_windows[hwnd] = info;
@@ -408,8 +417,13 @@ WIN2LIN_EXPORT BOOL WINAPI ShowWindow(HWND hwnd, int cmd) {
     if (it == g_windows.end()) return 0;
     it->second.visible = (cmd != 0 /* SW_HIDE */);
     if (it->second.sdl_window) {
-        if (cmd == 0) SDL_HideWindow(static_cast<SDL_Window*>(it->second.sdl_window));
-        else SDL_ShowWindow(static_cast<SDL_Window*>(it->second.sdl_window));
+        auto* sdl_w = static_cast<SDL_Window*>(it->second.sdl_window);
+        if (cmd == 0) SDL_HideWindow(sdl_w);
+        else {
+            SDL_ShowWindow(sdl_w);
+            SDL_SetWindowPosition(sdl_w, 0, 0); // Force onto primary monitor
+            SDL_RaiseWindow(sdl_w);
+        }
     }
     USER32_INFO("ShowWindow cmd=%d", cmd);
     return 1;
