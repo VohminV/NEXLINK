@@ -1101,3 +1101,117 @@ WIN2LIN_EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD n,
 WIN2LIN_EXPORT void WINAPI RtlCaptureContext(void* ctx) { if (ctx) std::memset(ctx, 0, 0x4D8); }
 WIN2LIN_EXPORT void* WINAPI RtlLookupFunctionEntry(uint64_t, uint64_t*, void*) { return nullptr; }
 WIN2LIN_EXPORT void WINAPI RtlUnwindEx(void*, void*, void*, void*, void*, void*) {}
+
+WIN2LIN_EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode) {
+    if (lpExitCode) *lpExitCode = 0;
+    return TRUE;
+}
+
+WIN2LIN_EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR lpFileName, LPVOID lpFindFileData) {
+    (void)lpFileName; (void)lpFindFileData;
+    return INVALID_HANDLE_VALUE;
+}
+WIN2LIN_EXPORT BOOL WINAPI FindNextFileW(HANDLE hFindFile, LPVOID lpFindFileData) {
+    (void)hFindFile; (void)lpFindFileData;
+    return FALSE;
+}
+WIN2LIN_EXPORT BOOL WINAPI FindClose(HANDLE hFindFile) {
+    (void)hFindFile;
+    return TRUE;
+}
+
+WIN2LIN_EXPORT DWORD WINAPI GetFileAttributesW(LPCWSTR lpFileName) {
+    (void)lpFileName;
+    return INVALID_FILE_ATTRIBUTES;
+}
+
+WIN2LIN_EXPORT LPSTR WINAPI GetCommandLineA(void) {
+    static char cmdline[] = "";
+    return cmdline;
+}
+WIN2LIN_EXPORT LPWSTR WINAPI GetCommandLineW(void) {
+    static WCHAR cmdline[] = u"";
+    return cmdline;
+}
+
+WIN2LIN_EXPORT LPVOID WINAPI GetEnvironmentStringsW(void) {
+    return nullptr;
+}
+WIN2LIN_EXPORT BOOL WINAPI FreeEnvironmentStringsW(LPWSTR penv) {
+    (void)penv;
+    return TRUE;
+}
+
+WIN2LIN_EXPORT DWORD WINAPI GetModuleFileNameW(HANDLE hModule, LPWSTR lpFilename, DWORD nSize) {
+    (void)hModule;
+    if (lpFilename && nSize > 0) {
+        lpFilename[0] = L'\0';
+    }
+    return 0;
+}
+
+WIN2LIN_EXPORT int WINAPI MessageBoxW(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType) {
+    (void)hWnd; (void)lpText; (void)lpCaption; (void)uType;
+    return 0;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI FlushFileBuffers(HANDLE hFile) {
+    (void)hFile;
+    return TRUE;
+}
+WIN2LIN_EXPORT DWORD WINAPI GetFileType(HANDLE hFile) {
+    (void)hFile;
+    return FILE_TYPE_UNKNOWN;
+}
+
+WIN2LIN_EXPORT UINT WINAPI GetACP(void) { return CP_UTF8; }
+WIN2LIN_EXPORT UINT WINAPI GetOEMCP(void) { return CP_UTF8; }
+WIN2LIN_EXPORT UINT WINAPI GetConsoleOutputCP(void) { return CP_UTF8; }
+
+WIN2LIN_EXPORT BOOL WINAPI GetCPInfo(UINT CodePage, LPCPINFO lpCPInfo) {
+    (void)CodePage;
+    if (lpCPInfo) std::memset(lpCPInfo, 0, sizeof(*lpCPInfo));
+    return TRUE;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI CreateProcessW(LPCWSTR, LPWSTR, LPVOID, LPVOID, BOOL, DWORD, LPVOID, LPCWSTR, LPVOID, LPVOID) {
+    return FALSE;
+}
+WIN2LIN_EXPORT void* WINAPI EncodePointer(void* p) { return p; }
+WIN2LIN_EXPORT DWORD WINAPI FlsAlloc(void*) { return 0; }
+WIN2LIN_EXPORT BOOL WINAPI FlsFree(DWORD) { return TRUE; }
+WIN2LIN_EXPORT void* WINAPI FlsGetValue(DWORD) { return nullptr; }
+WIN2LIN_EXPORT BOOL WINAPI FlsSetValue(DWORD, void*) { return TRUE; }
+WIN2LIN_EXPORT DWORD WINAPI GetEnvironmentVariableW(LPCWSTR, LPWSTR, DWORD) {
+    return 0;
+}
+WIN2LIN_EXPORT BOOL WINAPI GetModuleHandleExW(DWORD, LPCWSTR, HMODULE*) {
+    return FALSE;
+}
+WIN2LIN_EXPORT DWORD WINAPI GetStringTypeW(DWORD, LPCWSTR, int, LPWORD) {
+    return 0;
+}
+WIN2LIN_EXPORT void WINAPI InitializeSListHead(void*) {}
+WIN2LIN_EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD) { return FALSE; }
+WIN2LIN_EXPORT BOOL WINAPI IsValidCodePage(UINT) { return TRUE; }
+WIN2LIN_EXPORT DWORD WINAPI SetFilePointerEx(HANDLE, LARGE_INTEGER, PLONG, DWORD) {
+    return 0;
+}
+
+WIN2LIN_EXPORT HANDLE WINAPI FindFirstFileExW(LPCWSTR, DWORD, LPVOID, DWORD, LPVOID, DWORD) {
+    return INVALID_HANDLE_VALUE;
+}
+WIN2LIN_EXPORT HRSRC WINAPI FindResourceW(HMODULE, LPCWSTR, LPCWSTR) { return nullptr; }
+WIN2LIN_EXPORT HGLOBAL WINAPI LoadResource(HMODULE, HRSRC) { return nullptr; }
+WIN2LIN_EXPORT LPVOID WINAPI LockResource(HGLOBAL) { return nullptr; }
+WIN2LIN_EXPORT DWORD WINAPI SizeofResource(HMODULE, HRSRC) { return 0; }
+WIN2LIN_EXPORT DWORD WINAPI LCMapStringW(LCID, DWORD, LPCWSTR, int, LPWSTR, int) {
+    return 0;
+}
+WIN2LIN_EXPORT BOOL WINAPI WriteConsoleW(HANDLE, LPCVOID, DWORD, LPDWORD, LPVOID) {
+    return TRUE;
+}
+WIN2LIN_EXPORT int WINAPI wsprintfW(LPWSTR, LPCWSTR, ...) { return 0; }
+
+WIN2LIN_EXPORT void* WINAPI RtlPcToFileHeader(void*, void**) { return nullptr; }
+WIN2LIN_EXPORT LONG WINAPI UnhandledExceptionFilter(void*) { return 0; }

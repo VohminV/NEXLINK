@@ -135,4 +135,8 @@ extern "C" WINAPI HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFl
     return -2147467263;
 }
 
+extern "C" WINAPI BOOL WINAPI ShellExecuteExW(void*) {
+    return FALSE;
+}
+
 } // namespace win2lin

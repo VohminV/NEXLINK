@@ -29,9 +29,6 @@
 #include <vector>
 
 using namespace win2lin::win;
-
-constexpr int TRUE = 1;
-constexpr int FALSE = 0;
 using LPPOINT = POINT*;
 
 namespace {

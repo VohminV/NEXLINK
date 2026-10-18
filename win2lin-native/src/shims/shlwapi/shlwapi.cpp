@@ -170,4 +170,9 @@ extern "C" WINAPI HRESULT SHGetStockIconInfo(SHSTOCKICONID siid, UINT uFlags, SH
     return -2147467263;
 }
 
+extern "C" WINAPI BOOL WINAPI PathCanonicalizeW(LPWSTR lpszDst, LPCWSTR lpszSrc) {
+    (void)lpszDst; (void)lpszSrc;
+    return FALSE;
+}
+
 } // namespace win2lin

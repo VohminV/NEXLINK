@@ -192,6 +192,38 @@ constexpr DWORD ERROR_INVALID_HANDLE = 6;
 constexpr DWORD ERROR_INVALID_PARAMETER = 87;
 constexpr DWORD ERROR_CALL_NOT_IMPLEMENTED = 120;
 
+// BOOL
+constexpr int TRUE = 1;
+constexpr int FALSE = 0;
+
+// File type / attributes
+constexpr DWORD FILE_TYPE_UNKNOWN = 0x0000;
+constexpr DWORD FILE_TYPE_DISK = 0x0001;
+constexpr DWORD INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+
+// Code pages
+constexpr UINT CP_UTF8 = 65001;
+constexpr UINT CP_ACP = 0;
+
+// Invalid handle
+const HANDLE INVALID_HANDLE_VALUE = (HANDLE)(void*)-1;
+
+// CPINFO structure (for GetCPInfo)
+struct CPINFO {
+    UINT MaxCharSize;
+    BYTE DefaultChar[2];
+    BYTE LeadByte[12];
+};
+using LPCPINFO = CPINFO*;
+
+using LPWORD = WORD*;
+using LARGE_INTEGER = int64_t;
+using PLONG = LONG*;
+
+using LCID = DWORD;
+using HRSRC = void*;
+using HGLOBAL = void*;
+
 } // namespace win2lin::win
 
 // Mark a function as exported from a shim shared library.
