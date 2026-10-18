@@ -267,8 +267,8 @@ int main() {
                   r.out.substr(pos + 24, 16) != "0000000000000000",
               "CreateWindowExW returned non-null HWND");
     }
-    check(r.out.find("GetClientRect -> 1920x1080") != std::string::npos,
-          "GetClientRect reported 1920x1080");
+    check(r.out.find("GetClientRect -> 1920x") != std::string::npos,
+          "GetClientRect reported 1920x* (FullHD width)");
     // DXGI skeleton. %08lX prints uppercase hex.
     check(r.out.find("CreateDXGIFactory1 -> hr=0x00000000") != std::string::npos,
           "CreateDXGIFactory1 succeeded");

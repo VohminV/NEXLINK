@@ -312,10 +312,10 @@ WIN2LIN_EXPORT HWND WINAPI CreateWindowExW(DWORD ex_style, LPCWSTR class_name,
     }
 
     const int win_w = (width <= 0 || width == static_cast<int>(0x80000000))
-                          ? 1280  // Default smaller than full-screen to avoid smart-placement
+                          ? 1920  // FullHD default
                           : width;
     const int win_h = (height <= 0 || height == static_cast<int>(0x80000000))
-                          ? 720   // Default smaller than full-screen
+                          ? 1080  // FullHD default
                           : height;
     const int win_x = 0;
     const int win_y = 0;
@@ -353,12 +353,9 @@ WIN2LIN_EXPORT HWND WINAPI CreateWindowExW(DWORD ex_style, LPCWSTR class_name,
     // Auto-show the window so games that forget ShowWindow still display.
     if (sdl_win) {
         auto* sdl_w = static_cast<SDL_Window*>(sdl_win);
-        // Force onto primary monitor at a reasonable size to avoid
-        // window-manager smart-placement on multi-monitor setups.
+        // Force onto primary monitor at requested size (FullHD 1920x1080 default).
         SDL_SetWindowPosition(sdl_w, 0, 0);
-        if (win_w > 1280 || win_h > 720) {
-            SDL_SetWindowSize(sdl_w, 1280, 720);
-        }
+        SDL_SetWindowSize(sdl_w, win_w, win_h);
         SDL_ShowWindow(sdl_w);
         SDL_RaiseWindow(sdl_w);
         info.visible = true;
