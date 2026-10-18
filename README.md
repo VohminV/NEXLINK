@@ -201,9 +201,16 @@ stubs for `advapi32`, `ws2_32`, `winmm`, `dinput8`, `dsound`, `version`,
 `gdiplus`, `msvcp71/80/90`, `msacm32` — covering the import surface of most
 2000–2010 era Windows games.
 
-Graphics rendering is stub-level: `Clear` + `Present` work, but fixed-function
-pipeline state (lights, materials, complex blend states) is not yet translated
-to Vulkan draw commands.
+Graphics rendering: `Clear` + `Present` work, vertex/index buffers and textures
+are bound to Vulkan via descriptor sets, and `DrawPrimitive`/`DrawIndexedPrimitive`
+issue `vkCmdDraw`/`vkCmdDrawIndexed`. Fixed-function pipeline state (lights,
+materials, complex blend states) is partially translated — enough to render
+colored/textured geometry from most 2000–2010 era D3D9 games.
+
+## CI
+
+GitHub Actions workflow builds and tests on every push/PR (see
+`.github/workflows/ci.yml`).
 
 ## License
 

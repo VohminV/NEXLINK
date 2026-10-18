@@ -309,6 +309,14 @@ static struct {
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    // Descriptor objects
+    VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptor_sets;
+    // Uniform buffer (MVP + tint)
+    VkBuffer uniform_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory uniform_memory = VK_NULL_HANDLE;
+    void* uniform_mapped = nullptr;
 } g_vk;
 
 static bool g_vk_ready = false;
@@ -544,17 +552,87 @@ struct D3D9Device : IDirect3DDevice9 {
         rpCi.pSubpasses = &subpass;
         vkCreateRenderPass(g_vk.dev, &rpCi, nullptr, &g_vk.render_pass);
 
+        // ---- descriptor set layout (UBO + sampler) ----
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dslCi{};
+        dslCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslCi.bindingCount = 2;
+        dslCi.pBindings = bindings;
+        vkCreateDescriptorSetLayout(g_vk.dev, &dslCi, nullptr, &g_vk.descriptor_set_layout);
+
         // ---- pipeline layout ----
         VkPipelineLayoutCreateInfo plCi{};
         plCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plCi.setLayoutCount = 1;
+        plCi.pSetLayouts = &g_vk.descriptor_set_layout;
         vkCreatePipelineLayout(g_vk.dev, &plCi, nullptr, &g_vk.pipeline_layout);
+
+        // ---- descriptor pool ----
+        VkDescriptorPoolSize poolSizes[2] = {};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount = 4;
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = 16;
+
+        VkDescriptorPoolCreateInfo dpCi{};
+        dpCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpCi.maxSets = 4;
+        dpCi.poolSizeCount = 2;
+        dpCi.pPoolSizes = poolSizes;
+        vkCreateDescriptorPool(g_vk.dev, &dpCi, nullptr, &g_vk.descriptor_pool);
+
+        // ---- uniform buffer ----
+        VkResult r = create_buffer(g_vk.dev, g_vk.phy, 256,
+                                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   &g_vk.uniform_buffer, &g_vk.uniform_memory, &g_vk.uniform_mapped);
+        if (r != VK_SUCCESS) {
+            LOG_ERROR("D3D9: uniform buffer creation failed");
+            return false;
+        }
+
+        // ---- allocate descriptor sets for each swapchain image ----
+        uint32_t ds_imgCount = (uint32_t)g_vk.images.size();
+        g_vk.descriptor_sets.resize(ds_imgCount);
+        std::vector<VkDescriptorSetLayout> layouts(ds_imgCount, g_vk.descriptor_set_layout);
+        VkDescriptorSetAllocateInfo dsaCi{};
+        dsaCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsaCi.descriptorPool = g_vk.descriptor_pool;
+        dsaCi.descriptorSetCount = ds_imgCount;
+        dsaCi.pSetLayouts = layouts.data();
+        vkAllocateDescriptorSets(g_vk.dev, &dsaCi, g_vk.descriptor_sets.data());
+
+        // ---- update each descriptor set with uniform buffer ----
+        for (uint32_t i = 0; i < ds_imgCount; ++i) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = g_vk.uniform_buffer;
+            bufferInfo.offset = 0;
+            bufferInfo.range = 256;
+
+            VkWriteDescriptorSet writes[1] = {};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = g_vk.descriptor_sets[i];
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &bufferInfo;
+            vkUpdateDescriptorSets(g_vk.dev, 1, writes, 0, nullptr);
+        }
 
         // ---- graphics pipeline ----
         create_pipeline();
 
         g_vk_ready = true;
         g_has_shaders = true;
-        create_pipeline();
         LOG_INFO("D3D9: device initialized, swapchain %ux%u", g_vk.extent.width, g_vk.extent.height);
         return true;
     }
@@ -584,31 +662,35 @@ struct D3D9Device : IDirect3DDevice9 {
         stages[1].module = frag_mod;
         stages[1].pName = "main";
 
-        // Vertex input (POSITION_COLOR: pos float2 + color DWORD as 4 bytes -> we treat as 4 floats? No, D3DFVF_DIFFUSE is packed ARGB)
-        // For simplicity: stride 24 (pos x,y as float2 at 0, color as 4 floats? Actually D3DFVF_DIFFUSE is 4 bytes packed)
-        // We'll use pos as 2 floats and color as 4 bytes converted in shader to vec4.
+        // Vertex input: pos(float2) + color(DWORD as uint) + texcoord(float2)
+        // stride = 8 + 4 + 8 = 20, align to 24 for simplicity
         VkVertexInputBindingDescription binding{};
         binding.binding = 0;
-        binding.stride = 24; // pos(2*4) + color(4) + padding to 24? Let's use 24
+        binding.stride = 24;
         binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
         // Attribute 0: position (float2)
-        VkVertexInputAttributeDescription attr[2] = {};
+        // Attribute 1: color (unpacked from uint)
+        // Attribute 2: texcoord (float2)
+        VkVertexInputAttributeDescription attr[3] = {};
         attr[0].binding = 0;
         attr[0].location = 0;
         attr[0].format = VK_FORMAT_R32G32_SFLOAT;
         attr[0].offset = 0;
-        // Attribute 1: color (unpacked in shader from uint)
         attr[1].binding = 0;
         attr[1].location = 1;
         attr[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attr[1].offset = 8; // simplified: treat first 4 bytes after pos as color
+        attr[1].offset = 8;
+        attr[2].binding = 0;
+        attr[2].location = 2;
+        attr[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attr[2].offset = 16;
 
         VkPipelineVertexInputStateCreateInfo viCi{};
         viCi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         viCi.vertexBindingDescriptionCount = 1;
         viCi.pVertexBindingDescriptions = &binding;
-        viCi.vertexAttributeDescriptionCount = 2;
+        viCi.vertexAttributeDescriptionCount = 3;
         viCi.pVertexAttributeDescriptions = attr;
 
         VkPipelineInputAssemblyStateCreateInfo iaCi{};
@@ -717,6 +799,10 @@ struct D3D9Device : IDirect3DDevice9 {
         if (g_vk.framebuffer) vkDestroyFramebuffer(g_vk.dev, g_vk.framebuffer, nullptr);
         if (g_vk.pipeline) vkDestroyPipeline(g_vk.dev, g_vk.pipeline, nullptr);
         if (g_vk.pipeline_layout) vkDestroyPipelineLayout(g_vk.dev, g_vk.pipeline_layout, nullptr);
+        if (g_vk.descriptor_set_layout) vkDestroyDescriptorSetLayout(g_vk.dev, g_vk.descriptor_set_layout, nullptr);
+        if (g_vk.descriptor_pool) vkDestroyDescriptorPool(g_vk.dev, g_vk.descriptor_pool, nullptr);
+        if (g_vk.uniform_buffer) vkDestroyBuffer(g_vk.dev, g_vk.uniform_buffer, nullptr);
+        if (g_vk.uniform_memory) vkFreeMemory(g_vk.dev, g_vk.uniform_memory, nullptr);
         if (g_vk.render_pass) vkDestroyRenderPass(g_vk.dev, g_vk.render_pass, nullptr);
         if (g_vk.fence) vkDestroyFence(g_vk.dev, g_vk.fence, nullptr);
         if (g_vk.render_done) vkDestroySemaphore(g_vk.dev, g_vk.render_done, nullptr);
@@ -902,6 +988,20 @@ struct D3D9Device : IDirect3DDevice9 {
         cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(g_vk.cmd, &cbi);
 
+        // Update uniform buffer: simple orthographic projection
+        float w = (float)g_vk.extent.width;
+        float h = (float)g_vk.extent.height;
+        float mvp[16] = {
+            2.0f/w, 0.0f,   0.0f, 0.0f,
+            0.0f,  -2.0f/h, 0.0f, 0.0f,
+            0.0f,   0.0f,   1.0f, 0.0f,
+           -1.0f,   1.0f,   0.0f, 1.0f
+        };
+        // Apply stored world/view transforms
+        float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        memcpy(g_vk.uniform_mapped, mvp, sizeof(mvp));
+        memcpy((uint8_t*)g_vk.uniform_mapped + 64, tint, sizeof(tint));
+
         // Transition swapchain image to color attachment
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -927,6 +1027,9 @@ struct D3D9Device : IDirect3DDevice9 {
         vkCmdBeginRenderPass(g_vk.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
         vkCmdBindPipeline(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline);
+        if (!g_vk.descriptor_sets.empty()) {
+            vkCmdBindDescriptorSets(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline_layout, 0, 1, &g_vk.descriptor_sets[0], 0, nullptr);
+        }
         VkViewport vp{ 0, 0, (float)g_vk.extent.width, (float)g_vk.extent.height, 0.0f, 1.0f };
         VkRect2D sc{ {0, 0}, g_vk.extent };
         vkCmdSetViewport(g_vk.cmd, 0, 1, &vp);
@@ -1003,6 +1106,23 @@ struct D3D9Device : IDirect3DDevice9 {
         if (stage < 8) {
             self->texture_stages[stage] = reinterpret_cast<IDirect3DTexture9*>(tex);
         }
+        // Update descriptor set binding 1 with the texture
+        if (!g_vk.descriptor_sets.empty() && tex) {
+            auto d3d_tex = reinterpret_cast<D3DTexture*>(tex);
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.sampler = d3d_tex->sampler;
+            imageInfo.imageView = d3d_tex->view;
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = g_vk.descriptor_sets[0];
+            write.dstBinding = 1;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &imageInfo;
+            vkUpdateDescriptorSets(g_vk.dev, 1, &write, 0, nullptr);
+        }
         return D3D_OK;
     }
     static HRESULT WINAPI GetSamplerState(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD*) { return D3D_OK; }
@@ -1025,6 +1145,9 @@ struct D3D9Device : IDirect3DDevice9 {
         auto self = static_cast<D3D9Device*>(iface);
         if (!g_has_shaders) return D3D_OK;
         vkCmdBindPipeline(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline);
+        if (!g_vk.descriptor_sets.empty()) {
+            vkCmdBindDescriptorSets(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline_layout, 0, 1, &g_vk.descriptor_sets[0], 0, nullptr);
+        }
         // Bind vertex buffer from stream 0
         if (self->streams[0]) {
             auto vb = static_cast<D3DVertexBuffer*>(self->streams[0]);
@@ -1039,6 +1162,9 @@ struct D3D9Device : IDirect3DDevice9 {
         auto self = static_cast<D3D9Device*>(iface);
         if (!g_has_shaders) return D3D_OK;
         vkCmdBindPipeline(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline);
+        if (!g_vk.descriptor_sets.empty()) {
+            vkCmdBindDescriptorSets(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline_layout, 0, 1, &g_vk.descriptor_sets[0], 0, nullptr);
+        }
         if (self->streams[0]) {
             auto vb = static_cast<D3DVertexBuffer*>(self->streams[0]);
             VkDeviceSize offset = self->stream_offsets[0];

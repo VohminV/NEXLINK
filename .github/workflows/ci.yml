@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        apt-get update && apt-get install -y \
+          cmake ninja-build g++ python3 pkg-config \
+          libvulkan-dev libsdl2-dev \
+          x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ \
+          glslang-tools \
+          ca-certificates wget
+
+    - name: Install LIEF
+      run: |
+        wget -q https://github.com/lief-project/LIEF/releases/download/0.13.1/LIEF-0.13.1-Linux-x86_64.tar.gz
+        tar -xzf LIEF-0.13.1-Linux-x86_64.tar.gz
+        echo "LIEF_DIR=$GITHUB_WORKSPACE/LIEF-0.13.1-Linux-x86_64" >> $GITHUB_ENV
+
+    - name: Configure
+      working-directory: ${{ github.workspace }}/win2lin-native
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DCMAKE_PREFIX_PATH="$LIEF_DIR" \
+          -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      working-directory: ${{ github.workspace }}/win2lin-native
+      run: |
+        cmake --build build
+
+    - name: Test
+      working-directory: ${{ github.workspace }}/win2lin-native/build
+      run: |
+        ctest --output-on-failure
