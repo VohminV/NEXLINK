@@ -96,9 +96,51 @@ if(MINGW_CXX)
     add_test(NAME msvcrt_gui COMMAND test_msvcrt_gui)
 endif()
 
+if(MINGW_CC)
+    set(FIXTURE_RELOC_PE "${CMAKE_CURRENT_BINARY_DIR}/reloc_test.exe")
+    add_custom_command(
+        OUTPUT "${FIXTURE_RELOC_PE}"
+        COMMAND "${MINGW_CC}" -O2 -nostdlib
+                -Wl,--dynamicbase -Wl,-e,EntryPoint
+                -o "${FIXTURE_RELOC_PE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reloc_test.c"
+                -lkernel32
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reloc_test.c"
+        COMMENT "Building relocation test PE fixture (reloc_test.exe)"
+        VERBATIM
+    )
+    add_custom_target(win2lin_reloc_fixture ALL DEPENDS "${FIXTURE_RELOC_PE}")
+    set(WIN2LIN_RELOC_TEST_PE "${FIXTURE_RELOC_PE}")
+endif()
+
 # ---------------------------------------------------------------------------
-# Phase 5: D3D9 shim test
+# Phase 5: Base relocation test
 # ---------------------------------------------------------------------------
+add_executable(test_reloc
+    test_reloc.cpp
+)
+
+target_link_libraries(test_reloc
+    PRIVATE
+    win2lin_relinker
+    ${LIEF_LIBRARIES}
+)
+
+target_include_directories(test_reloc PRIVATE ${LIEF_INCLUDE_DIRS})
+
+target_compile_definitions(test_reloc PRIVATE
+    WIN2LIN_TEST_BUILD_DIR="${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(MINGW_CC)
+    add_dependencies(test_reloc win2lin_reloc_fixture)
+endif()
+
+add_test(NAME reloc COMMAND test_reloc
+    ${WIN2LIN_RELOC_TEST_PE}
+    "$<TARGET_FILE_DIR:win_kernel32>"
+    "${CMAKE_CURRENT_BINARY_DIR}/reloc_test.elf"
+)
 add_executable(test_d3d9
     test_d3d9.cpp
 )

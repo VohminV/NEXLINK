@@ -33,6 +33,48 @@ namespace win2lin::d3d9 {
 #define FALSE 0
 #endif
 
+// Forward declaration of global Vulkan context (defined later)
+struct VulkanCtx;
+extern VulkanCtx g_vk;
+extern bool g_vk_ready;
+extern bool g_has_shaders;
+
+struct VulkanCtx {
+    VkInstance inst = VK_NULL_HANDLE;
+    VkPhysicalDevice phy = VK_NULL_HANDLE;
+    VkDevice dev = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t qfam = 0;
+    VkSurfaceKHR surf = VK_NULL_HANDLE;
+    VkSwapchainKHR sc = VK_NULL_HANDLE;
+    VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D extent{};
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkSemaphore image_acquired = VK_NULL_HANDLE;
+    VkSemaphore render_done = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    // Pipeline objects
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    // Descriptor objects
+    VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptor_sets;
+    // Uniform buffer (MVP + tint)
+    VkBuffer uniform_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory uniform_memory = VK_NULL_HANDLE;
+    void* uniform_mapped = nullptr;
+};
+
+VulkanCtx g_vk;
+bool g_vk_ready = false;
+bool g_has_shaders = false;
+
 // ---------------------------------------------------------------------------
 // Vulkan wrapper helpers
 // ---------------------------------------------------------------------------
@@ -215,6 +257,14 @@ struct D3DTexture : IDirect3DTexture9 {
     VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
     VkExtent2D extent{};
     UINT width = 0, height = 0;
+    // LockRect support
+    void* lock_mapped = nullptr;
+    UINT lock_level = 0;
+    RECT lock_rect{};
+    DWORD lock_flags = 0;
+    bool locked = false;
+    std::vector<uint8_t> lock_data; // staging copy of pixel data
+    UINT lock_pitch = 0;
 
     static HRESULT WINAPI QueryInterface(IDirect3DTexture9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
     static ULONG WINAPI AddRef(IDirect3DTexture9* iface) {
@@ -241,8 +291,113 @@ struct D3DTexture : IDirect3DTexture9 {
     static HRESULT WINAPI SetAutoGenFilterType(IDirect3DTexture9*, D3DTEXTUREFILTERTYPE) { return D3D_OK; }
     static HRESULT WINAPI GetAutoGenFilterType(IDirect3DTexture9*, D3DTEXTUREFILTERTYPE*) { return D3D_OK; }
     static HRESULT WINAPI GenerateMipSubLevels(IDirect3DTexture9*) { return D3D_OK; }
-    static HRESULT WINAPI LockRect(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD) { return D3DERR_INVALIDCALL; }
-    static HRESULT WINAPI UnlockRect(IDirect3DTexture9*, UINT) { return D3D_OK; }
+    static HRESULT WINAPI LockRect(IDirect3DTexture9* iface, UINT Level, D3DLOCKED_RECT* pLockedRect, const RECT* pRect, DWORD Flags) {
+        auto self = static_cast<D3DTexture*>(iface);
+        if (self->locked) return D3DERR_INVALIDCALL;
+        self->locked = true;
+        self->lock_level = Level;
+        if (pRect) self->lock_rect = *pRect;
+        self->lock_flags = Flags;
+
+        // Allocate staging memory for pixel data
+        UINT w = self->width;
+        UINT h = self->height;
+        if (pRect) {
+            w = pRect->right - pRect->left;
+            h = pRect->bottom - pRect->top;
+        }
+        // Assume 32-bit RGBA
+        self->lock_pitch = w * 4;
+        self->lock_data.resize(self->lock_pitch * h);
+        pLockedRect->pBits = self->lock_data.data();
+        pLockedRect->Pitch = self->lock_pitch;
+        return D3D_OK;
+    }
+    static HRESULT WINAPI UnlockRect(IDirect3DTexture9* iface, UINT Level) {
+        auto self = static_cast<D3DTexture*>(iface);
+        if (!self->locked) return D3DERR_INVALIDCALL;
+        self->locked = false;
+
+        // Upload pixel data to Vulkan texture via staging buffer
+        if (self->lock_data.empty()) return D3D_OK;
+
+        VkDevice dev = g_vk.dev;
+        VkDeviceSize uploadSize = self->lock_data.size();
+
+        // Create staging buffer
+        VkBuffer stageBuf = VK_NULL_HANDLE;
+        VkDeviceMemory stageMem = VK_NULL_HANDLE;
+        create_buffer(dev, g_vk.phy, uploadSize,
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      &stageBuf, &stageMem);
+
+        // Copy data to staging buffer
+        void* data;
+        vkMapMemory(dev, stageMem, 0, uploadSize, 0, &data);
+        memcpy(data, self->lock_data.data(), uploadSize);
+        vkUnmapMemory(dev, stageMem);
+
+        // One-time command buffer for upload
+        VkCommandBuffer uploadCmd;
+        VkCommandBufferAllocateInfo cbAi{};
+        cbAi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbAi.commandPool = g_vk.pool;
+        cbAi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        vkAllocateCommandBuffers(dev, &cbAi, &uploadCmd);
+
+        VkCommandBufferBeginInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(uploadCmd, &cbi);
+
+        // Transition image to transfer destination
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = self->img;
+        barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(uploadCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        // Copy buffer to image
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = self->lock_pitch / 4; // in texels
+        region.bufferImageHeight = 0;
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageOffset = { 0, 0, 0 };
+        region.imageExtent = { self->width, self->height, 1 };
+        vkCmdCopyBufferToImage(uploadCmd, stageBuf, self->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        // Transition back to shader read
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(uploadCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        vkEndCommandBuffer(uploadCmd);
+
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &uploadCmd;
+        vkQueueSubmit(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(g_vk.queue);
+
+        vkFreeCommandBuffers(dev, g_vk.pool, 1, &uploadCmd);
+        vkDestroyBuffer(dev, stageBuf, nullptr);
+        vkFreeMemory(dev, stageMem, nullptr);
+
+        self->lock_data.clear();
+        return D3D_OK;
+    }
     static HRESULT WINAPI AddDirtyRect(IDirect3DTexture9*, const RECT*) { return D3D_OK; }
 
     static const IDirect3DTexture9Vtbl vtbl;
@@ -284,47 +439,7 @@ const IDirect3DVertexDeclaration9Vtbl D3DVertexDeclaration::vtbl = {
     D3DVertexDeclaration::GetDevice, D3DVertexDeclaration::GetDeclaration,
 };
 
-// ---------------------------------------------------------------------------
-// Global Vulkan context
-// ---------------------------------------------------------------------------
-static struct {
-    VkInstance inst = VK_NULL_HANDLE;
-    VkPhysicalDevice phy = VK_NULL_HANDLE;
-    VkDevice dev = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
-    uint32_t qfam = 0;
-    VkSurfaceKHR surf = VK_NULL_HANDLE;
-    VkSwapchainKHR sc = VK_NULL_HANDLE;
-    VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
-    VkExtent2D extent{};
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkSemaphore image_acquired = VK_NULL_HANDLE;
-    VkSemaphore render_done = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
-    std::vector<VkImage> images;
-    std::vector<VkImageView> views;
-    // Pipeline objects
-    VkRenderPass render_pass = VK_NULL_HANDLE;
-    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
-    // Descriptor objects
-    VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
-    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-    std::vector<VkDescriptorSet> descriptor_sets;
-    // Uniform buffer (MVP + tint)
-    VkBuffer uniform_buffer = VK_NULL_HANDLE;
-    VkDeviceMemory uniform_memory = VK_NULL_HANDLE;
-    void* uniform_mapped = nullptr;
-} g_vk;
-
-static bool g_vk_ready = false;
-static bool g_has_shaders = false;
-
-// ---------------------------------------------------------------------------
 // COM helpers
-// ---------------------------------------------------------------------------
 static ULONG com_addref(uintptr_t* ref) {
     return (ULONG)(++(*ref));
 }
@@ -332,11 +447,9 @@ static ULONG com_release(uintptr_t* ref) {
     return (ULONG)(--(*ref));
 }
 
-// ---------------------------------------------------------------------------
-// IDirect3D9
-// ---------------------------------------------------------------------------
-struct D3D9Device; // forward declaration
-
+// ===========================================================================
+// IDirect3DDevice9 (defined first so D3D9::CreateDevice can instantiate it)
+// ===========================================================================
 struct D3D9Device : IDirect3DDevice9 {
     uintptr_t ref = 1;
     HWND hwnd = nullptr;

@@ -350,7 +350,8 @@ bool PeToElfConverter::parse_pe() {
              imports_.size());
 
     // Base relocations (needed for PIE/ET_DYN). DIR64 entries become
-    // R_X86_64_RELATIVE records with addend = value - imagebase.
+    // R_X86_64_RELATIVE records; DIR32/HIGHLOW entries become R_X86_64_32
+    // (or 32S) records with addend = value - imagebase.
     base_relocs_.clear();
     has_relocs_ = false;
     if (pe->has_relocations()) {
@@ -359,22 +360,38 @@ bool PeToElfConverter::parse_pe() {
                 if (e.type() == LIEF::PE::RelocationEntry::BASE_TYPES::ABS) {
                     continue; // padding
                 }
-                if (e.type() != LIEF::PE::RelocationEntry::BASE_TYPES::DIR64) {
+                const uint64_t rva = uint64_t(block.virtual_address()) + e.position();
+                PeBaseReloc reloc;
+                reloc.rva = rva;
+                reloc.type = static_cast<uint32_t>(e.type());
+
+                if (e.type() == LIEF::PE::RelocationEntry::BASE_TYPES::DIR64) {
+                    auto value = pe->get_int_from_virtual_address<uint64_t>(
+                        rva, LIEF::Binary::VA_TYPES::RVA);
+                    if (!value) {
+                        LOG_WARN("Could not read base relocation value at RVA 0x%llx",
+                                 (unsigned long long)rva);
+                        continue;
+                    }
+                    reloc.value = *value;
+                    base_relocs_.push_back(reloc);
+                    has_relocs_ = true;
+                } else if (e.type() == LIEF::PE::RelocationEntry::BASE_TYPES::HIGHLOW) {
+                    auto value = pe->get_int_from_virtual_address<uint32_t>(
+                        rva, LIEF::Binary::VA_TYPES::RVA);
+                    if (!value) {
+                        LOG_WARN("Could not read base relocation value at RVA 0x%llx",
+                                 (unsigned long long)rva);
+                        continue;
+                    }
+                    reloc.value = *value;
+                    base_relocs_.push_back(reloc);
+                    has_relocs_ = true;
+                } else {
                     LOG_WARN("Skipping unsupported base relocation type %d at RVA 0x%llx",
                              (int)e.type(),
-                             (unsigned long long)(block.virtual_address() + e.position()));
-                    continue;
-                }
-                const uint64_t rva = uint64_t(block.virtual_address()) + e.position();
-                auto value = pe->get_int_from_virtual_address<uint64_t>(
-                    rva, LIEF::Binary::VA_TYPES::RVA);
-                if (!value) {
-                    LOG_WARN("Could not read base relocation value at RVA 0x%llx",
                              (unsigned long long)rva);
-                    continue;
                 }
-                base_relocs_.push_back({rva, *value});
-                has_relocs_ = true;
             }
         }
     }
@@ -636,7 +653,14 @@ bool PeToElfConverter::generate_elf() {
         for (const PeBaseReloc& r : base_relocs_) {
             const int64_t addend =
                 static_cast<int64_t>(r.value) - static_cast<int64_t>(imagebase_);
-            relas.push_back({base + r.rva, ELF64_R_INFO(0, R_X86_64_RELATIVE), addend});
+            if (static_cast<uint32_t>(r.type) ==
+                static_cast<uint32_t>(LIEF::PE::RelocationEntry::BASE_TYPES::DIR64)) {
+                relas.push_back({base + r.rva, ELF64_R_INFO(0, R_X86_64_RELATIVE), addend});
+            } else {
+                // DIR32 / HIGHLOW: 32-bit absolute relocation.
+                // R_X86_64_32: S + A - P is truncated to 32 bits.
+                relas.push_back({base + r.rva, ELF64_R_INFO(0, R_X86_64_32), addend});
+            }
         }
     }
     for (const GlobDat& g : glob_dats) {

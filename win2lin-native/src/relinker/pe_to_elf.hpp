@@ -66,8 +66,9 @@ private:
         uint64_t iat_rva;    // RVA of the IAT slot that must hold the resolved address
     };
     struct PeBaseReloc {
-        uint64_t rva;        // RVA of the 8-byte slot to patch
+        uint64_t rva;        // RVA of the slot to patch
         uint64_t value;      // current absolute value (based at imagebase)
+        uint32_t type;       // PE relocation type (DIR64=10, DIR32/HIGHLOW=3)
     };
 
     uint64_t imagebase_ = 0;
