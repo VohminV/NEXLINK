@@ -95,3 +95,16 @@ if(MINGW_CXX)
 
     add_test(NAME msvcrt_gui COMMAND test_msvcrt_gui)
 endif()
+
+# ---------------------------------------------------------------------------
+# Phase 5: D3D9 shim test
+# ---------------------------------------------------------------------------
+add_executable(test_d3d9
+    test_d3d9.cpp
+)
+
+target_link_libraries(test_d3d9 PRIVATE win2lin_common dl)
+
+target_include_directories(test_d3d9 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_test(NAME d3d9 COMMAND test_d3d9 WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/lib)

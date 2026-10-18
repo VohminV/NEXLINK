@@ -35,10 +35,33 @@ per-game hacks. NEXLINK takes the opposite approach:
 | --- | --- |
 | `win2lin-native/src/relinker/` | PE → ELF static relinker (LIEF-based) and its CLI |
 | `win2lin-native/src/shims/kernel32/` | `libwin_kernel32.so` — POSIX backing for kernel32.dll |
-| `win2lin-native/src/shims/user32/` | `libwin_user32.so` (planned) |
-| `win2lin-native/src/shims/dxgi/` | `libwin_dxgi.so` (planned) |
-| `win2lin-native/src/shims/d3d11/` | `libwin_d3d11.so` — D3D11 → Vulkan (planned) |
-| `win2lin-native/src/upscaler/` | Offline texture upscaling pipeline (planned) |
+| `win2lin-native/src/shims/msvcrt/` | `libwin_msvcrt.so` — MSVCRT/C runtime shim |
+| `win2lin-native/src/shims/user32/` | `libwin_user32.so` — windowing, messages, GDI (SDL2-backed) |
+| `win2lin-native/src/shims/dxgi/` | `libwin_dxgi.so` — DXGI stub |
+| `win2lin-native/src/shims/d3d9/` | `libwin_d3d9.so` — D3D9 → Vulkan (device, swapchain, VB/IB, textures, draw) |
+| `win2lin-native/src/shims/d3dx9/` | `libwin_d3dx9.so` — D3DX9 helper stubs |
+| `win2lin-native/src/shims/d3dcompiler/` | `libwin_d3dcompiler.so` — HLSL compiler stub |
+| `win2lin-native/src/shims/advapi32/` | `libwin_advapi32.so` — registry, crypto, security stubs |
+| `win2lin-native/src/shims/ws2_32/` | `libwin_ws2_32.so` — Winsock stubs |
+| `win2lin-native/src/shims/winmm/` | `libwin_winmm.so` — multimedia timer/audio stubs |
+| `win2lin-native/src/shims/dinput8/` | `libwin_dinput8.so` — DirectInput stub |
+| `win2lin-native/src/shims/dsound/` | `libwin_dsound.so` — DirectSound stub |
+| `win2lin-native/src/shims/version/` | `libwin_version.so` — file version info stubs |
+| `win2lin-native/src/shims/shell32/` | `libwin_shell32.so` — shell stubs |
+| `win2lin-native/src/shims/shlwapi/` | `libwin_shlwapi.so` — lightweight shell stubs |
+| `win2lin-native/src/shims/ole32/` | `libwin_ole32.so` — COM stubs |
+| `win2lin-native/src/shims/oleaut32/` | `libwin_oleaut32.so` — COM automation stubs |
+| `win2lin-native/src/shims/imm32/` | `libwin_imm32.so` — IME stubs |
+| `win2lin-native/src/shims/usp10/` | `libwin_usp10.so` — Uniscribe stubs |
+| `win2lin-native/src/shims/uxtheme/` | `libwin_uxtheme.so` — visual styles stubs |
+| `win2lin-native/src/shims/dwmapi/` | `libwin_dwmapi.so` — DWM stubs |
+| `win2lin-native/src/shims/iphlpapi/` | `libwin_iphlpapi.so` — IP Helper stubs |
+| `win2lin-native/src/shims/crypt32/` | `libwin_crypt32.so` — CryptoAPI stubs |
+| `win2lin-native/src/shims/secur32/` | `libwin_secur32.so` — SSPI stubs |
+| `win2lin-native/src/shims/gdiplus/` | `libwin_gdiplus.so` — GDI+ stubs |
+| `win2lin-native/src/shims/msvcp71/80/90/` | `libwin_msvcp*.so` — C++ runtime stubs |
+| `win2lin-native/src/shims/msacm32/` | `libwin_msacm32.so` — ACM stubs |
+| `win2lin-native/src/gui/` | `win2lin-gui` — SDL2 front-end for relinker |
 | `win2lin-native/src/common/` | Logging, utilities, Windows type/ABI definitions |
 | `win2lin-native/tests/` | Unit + integration tests and MinGW fixtures |
 
@@ -92,11 +115,16 @@ following (see `src/shims/kernel32/kernel32.cpp`):
   `QueryPerformanceCounter/Frequency`, `GetLastError`, `SetLastError`
 * **Misc**: `IsDebuggerPresent`, `OutputDebugStringA/W`
 
-### 3. Graphics & upscaling (planned)
+### 3. Graphics & GUI
 
-`dxgi`/`d3d11` will translate Direct3D 11 calls to Vulkan, and the upscaler will
-provide an offline texture upscaling path (Real-ESRGAN based) so assets can be
-enhanced before launch rather than at frame time.
+`d3d9` translates Direct3D 9 calls to Vulkan: device creation, swapchain,
+vertex/index buffers, textures, fixed-function draw calls and present. The GUI
+(`win2lin-gui`) provides an SDL2 front-end: pick a Windows `.exe`, choose a
+Linux target directory, run the relinker, then launch the resulting ELF with
+`LD_LIBRARY_PATH` pointing at the shim `.so` files.
+
+No SPIR-V runtime compilation is required (no RDNA 2 GPU needed); shader bytecode
+is precompiled from GLSL to SPIR-V at build time via `glslangValidator`.
 
 ## Building
 
@@ -106,6 +134,9 @@ enhanced before launch rather than at frame time.
 * [LIEF](https://lief.re) (development headers + library, discoverable via
   `pkg-config`)
 * Vulkan loader development files
+* SDL2 development files
+* `glslangValidator` (for D3D9 shader compilation)
+* Python 3 (for embedding SPIR-V shaders)
 * *(tests only)* `x86_64-w64-mingw32-gcc` to build the PE fixture; tests skip
   the conversion checks if it is missing
 
@@ -159,8 +190,20 @@ Negative paths (missing input, non-PE input) are covered too.
 
 Phase 1 (relinker + `kernel32` shim + tests) is functional: CRT-free PE
 executables relink and run end-to-end, for both fixed-base (`ET_EXEC`) and PIE
-(`ET_DYN`) inputs. Subsequent phases target a broader `kernel32` surface,
-`user32`, and the D3D11 → Vulkan path.
+(`ET_DYN`) inputs.
+
+Phase 2 adds `msvcrt`, `user32`, `dxgi` and the `win2lin-gui` front-end.
+
+Phase 3 adds D3D9 → Vulkan rendering (device, swapchain, draw, present) plus
+stubs for `advapi32`, `ws2_32`, `winmm`, `dinput8`, `dsound`, `version`,
+`shell32`, `shlwapi`, `ole32`, `oleaut32`, `d3dx9_*`, `d3dcompiler_*`,
+`imm32`, `usp10`, `uxtheme`, `dwmapi`, `iphlpapi`, `crypt32`, `secur32`,
+`gdiplus`, `msvcp71/80/90`, `msacm32` — covering the import surface of most
+2000–2010 era Windows games.
+
+Graphics rendering is stub-level: `Clear` + `Present` work, but fixed-function
+pipeline state (lights, materials, complex blend states) is not yet translated
+to Vulkan draw commands.
 
 ## License
 

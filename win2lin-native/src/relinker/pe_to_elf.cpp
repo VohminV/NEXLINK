@@ -115,6 +115,21 @@ std::string normalize_dll_stem(const std::string& stem) {
     if (stem == "d3d9" || stem.rfind("d3dx9", 0) == 0 || stem.rfind("d3dcompiler", 0) == 0) {
         return "d3d9";
     }
+    if (stem.rfind("d3dx9", 0) == 0) return "d3dx9";
+    if (stem.rfind("d3dcompiler", 0) == 0) return "d3dcompiler";
+    if (stem.rfind("msvcp", 0) == 0) return "msvcp90";
+    if (stem == "msvcp71") return "msvcp71";
+    if (stem == "msvcp80") return "msvcp80";
+    if (stem == "msvcp90") return "msvcp90";
+    if (stem == "imm32") return "imm32";
+    if (stem == "usp10") return "usp10";
+    if (stem == "uxtheme") return "uxtheme";
+    if (stem == "dwmapi") return "dwmapi";
+    if (stem == "iphlpapi") return "iphlpapi";
+    if (stem == "crypt32") return "crypt32";
+    if (stem == "secur32") return "secur32";
+    if (stem == "gdiplus") return "gdiplus";
+    if (stem == "msacm32") return "msacm32";
     return stem;
 }
 

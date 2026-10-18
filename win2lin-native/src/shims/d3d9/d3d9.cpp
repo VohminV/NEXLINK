@@ -358,6 +358,16 @@ struct D3D9Device : IDirect3DDevice9 {
     std::vector<D3DTexture*> textures;
     std::vector<D3DVertexDeclaration*> declarations;
 
+    // Texture stages (up to 8)
+    IDirect3DTexture9* texture_stages[8] = {};
+
+    // Shader constants
+    FLOAT vs_constants[256][4] = {};
+    FLOAT ps_constants[256][4] = {};
+
+    // Transform matrices (world/view/proj)
+    D3DMATRIX transforms[256] = {};
+
     D3D9Device(HWND h, D3DPRESENT_PARAMETERS* p) : hwnd(h) {
         if (p) memcpy(&pp, p, sizeof(pp));
     }
@@ -945,7 +955,17 @@ struct D3D9Device : IDirect3DDevice9 {
         return D3D_OK;
     }
     static HRESULT WINAPI Clear(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, FLOAT, DWORD) { return D3D_OK; }
-    static HRESULT WINAPI SetTransform(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*) { return D3D_OK; }
+    static HRESULT WINAPI SetTransform(IDirect3DDevice9* iface, D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
+        auto self = static_cast<D3D9Device*>(iface);
+        if (state >= D3DTS_WORLD0 && state <= D3DTS_WORLD0 + 255) {
+            self->transforms[state - D3DTS_WORLD0] = *matrix;
+        } else if (state == D3DTS_VIEW) {
+            self->transforms[0] = *matrix; // store view in slot 0
+        } else if (state == D3DTS_PROJECTION) {
+            self->transforms[1] = *matrix; // store projection in slot 1
+        }
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetTransform(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, D3DMATRIX*) { return D3D_OK; }
     static HRESULT WINAPI MultiplyTransform(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*) { return D3D_OK; }
     static HRESULT WINAPI SetViewport(IDirect3DDevice9*, const D3DVIEWPORT9*) { return D3D_OK; }
@@ -979,8 +999,10 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI GetClipStatus(IDirect3DDevice9*, D3DCLIPSTATUS9*) { return D3D_OK; }
     static HRESULT WINAPI GetTexture(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9**) { return D3D_OK; }
     static HRESULT WINAPI SetTexture(IDirect3DDevice9* iface, DWORD stage, IDirect3DBaseTexture9* tex) {
-        // store texture on device state (we don't track per-stage deeply, just accept)
-        (void)iface; (void)stage; (void)tex;
+        auto self = static_cast<D3D9Device*>(iface);
+        if (stage < 8) {
+            self->texture_stages[stage] = reinterpret_cast<IDirect3DTexture9*>(tex);
+        }
         return D3D_OK;
     }
     static HRESULT WINAPI GetSamplerState(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD*) { return D3D_OK; }
@@ -1050,7 +1072,13 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI CreateVertexShader(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**) { return D3D_OK; }
     static HRESULT WINAPI SetVertexShader(IDirect3DDevice9*, IDirect3DVertexShader9*) { return D3D_OK; }
     static HRESULT WINAPI GetVertexShader(IDirect3DDevice9*, IDirect3DVertexShader9**) { return D3D_OK; }
-    static HRESULT WINAPI SetVertexShaderConstantF(IDirect3DDevice9*, UINT, const FLOAT*, UINT) { return D3D_OK; }
+    static HRESULT WINAPI SetVertexShaderConstantF(IDirect3DDevice9* iface, UINT start, const FLOAT* data, UINT count) {
+        auto self = static_cast<D3D9Device*>(iface);
+        for (UINT i = 0; i < count && start + i < 256; ++i) {
+            memcpy(self->vs_constants[start + i], data + i * 4, sizeof(float) * 4);
+        }
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetVertexShaderConstantF(IDirect3DDevice9*, UINT, FLOAT*, UINT) { return D3D_OK; }
     static HRESULT WINAPI SetVertexShaderConstantI(IDirect3DDevice9*, UINT, const INT*, UINT) { return D3D_OK; }
     static HRESULT WINAPI GetVertexShaderConstantI(IDirect3DDevice9*, UINT, INT*, UINT) { return D3D_OK; }
@@ -1073,7 +1101,13 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI CreatePixelShader(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**) { return D3D_OK; }
     static HRESULT WINAPI SetPixelShader(IDirect3DDevice9*, IDirect3DPixelShader9*) { return D3D_OK; }
     static HRESULT WINAPI GetPixelShader(IDirect3DDevice9*, IDirect3DPixelShader9**) { return D3D_OK; }
-    static HRESULT WINAPI SetPixelShaderConstantF(IDirect3DDevice9*, UINT, const FLOAT*, UINT) { return D3D_OK; }
+    static HRESULT WINAPI SetPixelShaderConstantF(IDirect3DDevice9* iface, UINT start, const FLOAT* data, UINT count) {
+        auto self = static_cast<D3D9Device*>(iface);
+        for (UINT i = 0; i < count && start + i < 256; ++i) {
+            memcpy(self->ps_constants[start + i], data + i * 4, sizeof(float) * 4);
+        }
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetPixelShaderConstantF(IDirect3DDevice9*, UINT, FLOAT*, UINT) { return D3D_OK; }
     static HRESULT WINAPI SetPixelShaderConstantI(IDirect3DDevice9*, UINT, const INT*, UINT) { return D3D_OK; }
     static HRESULT WINAPI GetPixelShaderConstantI(IDirect3DDevice9*, UINT, INT*, UINT) { return D3D_OK; }

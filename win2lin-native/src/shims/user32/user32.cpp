@@ -30,6 +30,10 @@
 
 using namespace win2lin::win;
 
+constexpr int TRUE = 1;
+constexpr int FALSE = 0;
+using LPPOINT = POINT*;
+
 namespace {
 
 // --------------------------------------------------------------------------
@@ -813,4 +817,28 @@ WIN2LIN_EXPORT BOOL WINAPI RegisterHotKey(HWND, int, UINT, UINT) {
 WIN2LIN_EXPORT BOOL WINAPI UnregisterHotKey(HWND, int) {
     USER32_UNIMPL("UnregisterHotKey");
     return 1;
+}
+
+WIN2LIN_EXPORT void* WINAPI GetStockObject(int) {
+    return nullptr;
+}
+
+WIN2LIN_EXPORT HCURSOR WINAPI SetCursor(HCURSOR hCursor) {
+    (void)hCursor;
+    return nullptr;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI ShowCursor(BOOL bShow) {
+    (void)bShow;
+    return TRUE;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI GetCursorPos(LPPOINT lpPoint) {
+    (void)lpPoint;
+    return TRUE;
+}
+
+WIN2LIN_EXPORT BOOL WINAPI SetCursorPos(int X, int Y) {
+    (void)X; (void)Y;
+    return TRUE;
 }
