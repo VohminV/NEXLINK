@@ -13,6 +13,7 @@ cmake-build-*/
 # CMake
 CMakeCache.txt
 CMakeFiles/
+Testing/
 cmake_install.cmake
 CTestTestfile.cmake
 install_manifest.txt
