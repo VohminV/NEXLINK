@@ -1215,3 +1215,12 @@ WIN2LIN_EXPORT int WINAPI wsprintfW(LPWSTR, LPCWSTR, ...) { return 0; }
 
 WIN2LIN_EXPORT void* WINAPI RtlPcToFileHeader(void*, void**) { return nullptr; }
 WIN2LIN_EXPORT LONG WINAPI UnhandledExceptionFilter(void*) { return 0; }
+
+WIN2LIN_EXPORT DWORD WINAPI GetFileVersionInfoSizeW(LPCWSTR lpszFileName, LPDWORD lpdwHandle) {
+    (void)lpszFileName; (void)lpdwHandle;
+    return 0;
+}
+WIN2LIN_EXPORT BOOL WINAPI GetFileVersionInfoW(LPCWSTR lpszFileName, DWORD dwHandle, DWORD dwLen, LPVOID lpData) {
+    (void)lpszFileName; (void)dwHandle; (void)dwLen; (void)lpData;
+    return FALSE;
+}

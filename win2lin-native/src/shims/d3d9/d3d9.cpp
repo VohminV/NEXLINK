@@ -15,6 +15,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <thread>
+#include <chrono>
 #include <vector>
 #include <unordered_map>
 
@@ -1372,6 +1374,20 @@ struct D3D9Device : IDirect3DDevice9 {
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(dev, sc, UINT64_MAX, ia, VK_NULL_HANDLE, &idx);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) return D3D_OK;
+
+        // Simple frame limiter: cap at ~60 FPS to prevent 100% CPU / overheating
+        // during extended play sessions
+        static uint64_t frame_count = 0;
+        static auto last_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last_time).count();
+        if (frame_count % 60 == 0) {
+            if (elapsed < 1000000 / 60) { // target 60 FPS
+                std::this_thread::sleep_for(std::chrono::microseconds(1000000 / 60 - elapsed));
+            }
+            last_time = std::chrono::steady_clock::now();
+        }
+        frame_count++;
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{};
