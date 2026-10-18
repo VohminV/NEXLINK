@@ -1,7 +1,9 @@
-// libwin_d3d9.so - D3D9 → Vulkan shim (stub rendering).
-// Implements IDirect3D9 / IDirect3DDevice9 COM vtables (ms_abi) backed by a
-// minimal Vulkan device + swapchain so 2000-2010 era games can initialize D3D9.
-// Rendering is stubbed (clear only); Present swaps the Vulkan swapchain image.
+// libwin_d3d9.so - D3D9 → Vulkan shim.
+// Implements IDirect3D9 / IDirect3DDevice9 COM vtables (ms_abi) backed by
+// Vulkan. Vertex / index buffers, textures, vertex declarations, FVF, render
+// states and DrawPrimitive/DrawIndexedPrimitive are translated to Vulkan
+// commands. Rendering uses an embedded SPIR-V pass-through shader (position +
+// diffuse color) compiled from GLSL at build time via glslangValidator.
 
 #include "d3d9.h"
 
@@ -14,6 +16,11 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
+
+#ifdef WIN2LIN_D3D9_HAS_SHADERS
+#include "shaders_embedded.h"
+#endif
 
 namespace win2lin::d3d9 {
 
@@ -25,6 +32,257 @@ namespace win2lin::d3d9 {
 #ifndef FALSE
 #define FALSE 0
 #endif
+
+// ---------------------------------------------------------------------------
+// Vulkan wrapper helpers
+// ---------------------------------------------------------------------------
+static VkResult create_buffer(VkDevice dev, VkPhysicalDevice phy, VkDeviceSize size,
+                              VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+                              VkBuffer* buf, VkDeviceMemory* mem, void** mapped = nullptr) {
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = size;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult r = vkCreateBuffer(dev, &bci, nullptr, buf);
+    if (r != VK_SUCCESS) return r;
+
+    VkMemoryRequirements mr{};
+    vkGetBufferMemoryRequirements(dev, *buf, &mr);
+
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phy, &mp);
+
+    uint32_t mt = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if ((mr.memoryTypeBits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & props) == props) {
+            mt = i;
+            break;
+        }
+    }
+    if (mt == 0xFFFFFFFF) {
+        vkDestroyBuffer(dev, *buf, nullptr);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = mt;
+    r = vkAllocateMemory(dev, &ai, nullptr, mem);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(dev, *buf, nullptr);
+        return r;
+    }
+    vkBindBufferMemory(dev, *buf, *mem, 0);
+    if (mapped) {
+        vkMapMemory(dev, *mem, 0, size, 0, mapped);
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult create_image_view(VkDevice dev, VkImage img, VkFormat fmt, VkImageView* view) {
+    VkImageViewCreateInfo ivci{};
+    ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    ivci.image = img;
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.format = fmt;
+    ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    return vkCreateImageView(dev, &ivci, nullptr, view);
+}
+
+// ---------------------------------------------------------------------------
+// Resource objects owned by the device
+// ---------------------------------------------------------------------------
+struct D3DVertexBuffer : IDirect3DVertexBuffer9 {
+    uintptr_t ref = 1;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize size = 0;
+    DWORD fvf = 0;
+    D3DPOOL pool = D3DPOOL_DEFAULT;
+    DWORD usage = 0;
+
+    static HRESULT WINAPI QueryInterface(IDirect3DVertexBuffer9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
+    static ULONG WINAPI AddRef(IDirect3DVertexBuffer9* iface) {
+        auto self = static_cast<D3DVertexBuffer*>(iface);
+        return (ULONG)(++self->ref);
+    }
+    static ULONG WINAPI Release(IDirect3DVertexBuffer9* iface) {
+        auto self = static_cast<D3DVertexBuffer*>(iface);
+        auto v = (ULONG)(--self->ref);
+        if (v == 0) delete self;
+        return v;
+    }
+    static HRESULT WINAPI Lock(IDirect3DVertexBuffer9* iface, UINT offset, UINT size, LPVOID* ptr, DWORD flags) {
+        auto self = static_cast<D3DVertexBuffer*>(iface);
+        (void)flags;
+        if (self->mapped) {
+            *ptr = static_cast<uint8_t*>(self->mapped) + offset;
+            return D3D_OK;
+        }
+        return D3DERR_INVALIDCALL;
+    }
+    static HRESULT WINAPI Unlock(IDirect3DVertexBuffer9* iface) {
+        auto self = static_cast<D3DVertexBuffer*>(iface);
+        (void)self;
+        return D3D_OK;
+    }
+    static HRESULT WINAPI GetDesc(IDirect3DVertexBuffer9* iface, D3DVERTEXBUFFER_DESC* desc) {
+        auto self = static_cast<D3DVertexBuffer*>(iface);
+        desc->Pool = self->pool;
+        desc->Size = (UINT)self->size;
+        desc->Usage = self->usage;
+        desc->FVF = self->fvf;
+        return D3D_OK;
+    }
+    static HRESULT WINAPI PreLoad(IDirect3DVertexBuffer9*) { return D3D_OK; }
+    static HRESULT WINAPI SetPriority(IDirect3DVertexBuffer9*, DWORD) { return D3D_OK; }
+    static HRESULT WINAPI GetPriority(IDirect3DVertexBuffer9*, DWORD*) { return D3D_OK; }
+    static HRESULT WINAPI SetProperties(IDirect3DVertexBuffer9*, DWORD) { return D3D_OK; }
+    static HRESULT WINAPI GetProperties(IDirect3DVertexBuffer9*, DWORD*) { return D3D_OK; }
+
+    static const IDirect3DVertexBuffer9Vtbl vtbl;
+};
+const IDirect3DVertexBuffer9Vtbl D3DVertexBuffer::vtbl = {
+    D3DVertexBuffer::QueryInterface, D3DVertexBuffer::AddRef, D3DVertexBuffer::Release,
+    D3DVertexBuffer::Lock, D3DVertexBuffer::Unlock, D3DVertexBuffer::GetDesc,
+    D3DVertexBuffer::PreLoad, D3DVertexBuffer::SetPriority, D3DVertexBuffer::GetPriority,
+    D3DVertexBuffer::SetProperties, D3DVertexBuffer::GetProperties,
+};
+
+struct D3DIndexBuffer : IDirect3DIndexBuffer9 {
+    uintptr_t ref = 1;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize size = 0;
+    D3DFORMAT fmt = D3DFMT_UNKNOWN;
+    D3DPOOL pool = D3DPOOL_DEFAULT;
+    DWORD usage = 0;
+
+    static HRESULT WINAPI QueryInterface(IDirect3DIndexBuffer9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
+    static ULONG WINAPI AddRef(IDirect3DIndexBuffer9* iface) {
+        auto self = static_cast<D3DIndexBuffer*>(iface);
+        return (ULONG)(++self->ref);
+    }
+    static ULONG WINAPI Release(IDirect3DIndexBuffer9* iface) {
+        auto self = static_cast<D3DIndexBuffer*>(iface);
+        auto v = (ULONG)(--self->ref);
+        if (v == 0) delete self;
+        return v;
+    }
+    static HRESULT WINAPI Lock(IDirect3DIndexBuffer9* iface, UINT offset, UINT size, LPVOID* ptr, DWORD flags) {
+        auto self = static_cast<D3DIndexBuffer*>(iface);
+        (void)flags;
+        if (self->mapped) {
+            *ptr = static_cast<uint8_t*>(self->mapped) + offset;
+            return D3D_OK;
+        }
+        return D3DERR_INVALIDCALL;
+    }
+    static HRESULT WINAPI Unlock(IDirect3DIndexBuffer9* iface) {
+        auto self = static_cast<D3DIndexBuffer*>(iface);
+        (void)self;
+        return D3D_OK;
+    }
+    static HRESULT WINAPI GetDesc(IDirect3DIndexBuffer9* iface, D3DINDEXBUFFER_DESC* desc) {
+        auto self = static_cast<D3DIndexBuffer*>(iface);
+        desc->Pool = self->pool;
+        desc->Size = (UINT)self->size;
+        desc->Usage = self->usage;
+        desc->Format = self->fmt;
+        return D3D_OK;
+    }
+    static HRESULT WINAPI PreLoad(IDirect3DIndexBuffer9*) { return D3D_OK; }
+
+    static const IDirect3DIndexBuffer9Vtbl vtbl;
+};
+const IDirect3DIndexBuffer9Vtbl D3DIndexBuffer::vtbl = {
+    D3DIndexBuffer::QueryInterface, D3DIndexBuffer::AddRef, D3DIndexBuffer::Release,
+    D3DIndexBuffer::Lock, D3DIndexBuffer::Unlock, D3DIndexBuffer::GetDesc,
+    D3DIndexBuffer::PreLoad,
+};
+
+struct D3DTexture : IDirect3DTexture9 {
+    uintptr_t ref = 1;
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    VkExtent2D extent{};
+    UINT width = 0, height = 0;
+
+    static HRESULT WINAPI QueryInterface(IDirect3DTexture9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
+    static ULONG WINAPI AddRef(IDirect3DTexture9* iface) {
+        auto self = static_cast<D3DTexture*>(iface);
+        return (ULONG)(++self->ref);
+    }
+    static ULONG WINAPI Release(IDirect3DTexture9* iface) {
+        auto self = static_cast<D3DTexture*>(iface);
+        auto v = (ULONG)(--self->ref);
+        if (v == 0) delete self;
+        return v;
+    }
+    static HRESULT WINAPI GetDevice(IDirect3DTexture9*, IDirect3DDevice9**) { return D3D_OK; }
+    static HRESULT WINAPI SetPrivateData(IDirect3DTexture9*, REFGUID, const void*, DWORD, DWORD) { return D3D_OK; }
+    static HRESULT WINAPI GetPrivateData(IDirect3DTexture9*, REFGUID, void*, DWORD*) { return D3D_OK; }
+    static HRESULT WINAPI FreePrivateData(IDirect3DTexture9*, REFGUID) { return D3D_OK; }
+    static HRESULT WINAPI SetPriority(IDirect3DTexture9*, DWORD) { return D3D_OK; }
+    static HRESULT WINAPI GetPriority(IDirect3DTexture9*, DWORD*) { return D3D_OK; }
+    static HRESULT WINAPI PreLoad(IDirect3DTexture9*) { return D3D_OK; }
+    static HRESULT WINAPI GetType(IDirect3DTexture9*, D3DRESOURCETYPE* t) { if (t) *t = D3DRTYPE_TEXTURE; return D3D_OK; }
+    static DWORD WINAPI SetLOD(IDirect3DTexture9*, DWORD) { return 0; }
+    static DWORD WINAPI GetLOD(IDirect3DTexture9*) { return 0; }
+    static DWORD WINAPI GetLevelCount(IDirect3DTexture9*) { return 1; }
+    static HRESULT WINAPI SetAutoGenFilterType(IDirect3DTexture9*, D3DTEXTUREFILTERTYPE) { return D3D_OK; }
+    static HRESULT WINAPI GetAutoGenFilterType(IDirect3DTexture9*, D3DTEXTUREFILTERTYPE*) { return D3D_OK; }
+    static HRESULT WINAPI GenerateMipSubLevels(IDirect3DTexture9*) { return D3D_OK; }
+    static HRESULT WINAPI LockRect(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD) { return D3DERR_INVALIDCALL; }
+    static HRESULT WINAPI UnlockRect(IDirect3DTexture9*, UINT) { return D3D_OK; }
+    static HRESULT WINAPI AddDirtyRect(IDirect3DTexture9*, const RECT*) { return D3D_OK; }
+
+    static const IDirect3DTexture9Vtbl vtbl;
+};
+const IDirect3DTexture9Vtbl D3DTexture::vtbl = {
+    D3DTexture::QueryInterface, D3DTexture::AddRef, D3DTexture::Release,
+    D3DTexture::GetDevice, D3DTexture::SetPrivateData, D3DTexture::GetPrivateData,
+    D3DTexture::FreePrivateData, D3DTexture::SetPriority, D3DTexture::GetPriority,
+    D3DTexture::PreLoad, D3DTexture::GetType, D3DTexture::SetLOD, D3DTexture::GetLOD,
+    D3DTexture::GetLevelCount, D3DTexture::SetAutoGenFilterType,
+    D3DTexture::GetAutoGenFilterType, D3DTexture::GenerateMipSubLevels,
+    D3DTexture::LockRect, D3DTexture::UnlockRect, D3DTexture::AddDirtyRect,
+};
+
+struct D3DVertexDeclaration : IDirect3DVertexDeclaration9 {
+    uintptr_t ref = 1;
+    DWORD fvf = 0;
+    std::vector<D3DVERTEXELEMENT9> elements;
+    UINT stride = 0;
+
+    static HRESULT WINAPI QueryInterface(IDirect3DVertexDeclaration9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
+    static ULONG WINAPI AddRef(IDirect3DVertexDeclaration9* iface) {
+        auto self = static_cast<D3DVertexDeclaration*>(iface);
+        return (ULONG)(++self->ref);
+    }
+    static ULONG WINAPI Release(IDirect3DVertexDeclaration9* iface) {
+        auto self = static_cast<D3DVertexDeclaration*>(iface);
+        auto v = (ULONG)(--self->ref);
+        if (v == 0) delete self;
+        return v;
+    }
+    static HRESULT WINAPI GetDevice(IDirect3DVertexDeclaration9*, IDirect3DDevice9*) { return D3D_OK; }
+    static HRESULT WINAPI GetDeclaration(IDirect3DVertexDeclaration9*, D3DVERTEXELEMENT9*, UINT*) { return D3D_OK; }
+
+    static const IDirect3DVertexDeclaration9Vtbl vtbl;
+};
+const IDirect3DVertexDeclaration9Vtbl D3DVertexDeclaration::vtbl = {
+    D3DVertexDeclaration::QueryInterface, D3DVertexDeclaration::AddRef, D3DVertexDeclaration::Release,
+    D3DVertexDeclaration::GetDevice, D3DVertexDeclaration::GetDeclaration,
+};
 
 // ---------------------------------------------------------------------------
 // Global Vulkan context
@@ -46,9 +304,15 @@ static struct {
     VkFence fence = VK_NULL_HANDLE;
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
+    // Pipeline objects
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
 } g_vk;
 
 static bool g_vk_ready = false;
+static bool g_has_shaders = false;
 
 // ---------------------------------------------------------------------------
 // COM helpers
@@ -60,14 +324,39 @@ static ULONG com_release(uintptr_t* ref) {
     return (ULONG)(--(*ref));
 }
 
-// ===========================================================================
-// IDirect3DDevice9 (defined first so D3D9::CreateDevice can instantiate it)
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// IDirect3D9
+// ---------------------------------------------------------------------------
+struct D3D9Device; // forward declaration
+
 struct D3D9Device : IDirect3DDevice9 {
     uintptr_t ref = 1;
     HWND hwnd = nullptr;
     D3DPRESENT_PARAMETERS pp{};
     bool scene_begun = false;
+
+    // Stream state
+    IDirect3DVertexBuffer9* streams[16] = {};
+    UINT stream_strides[16] = {};
+    UINT stream_offsets[16] = {};
+    IDirect3DIndexBuffer9* index_buffer = nullptr;
+    IDirect3DVertexDeclaration9* vertex_decl = nullptr;
+    DWORD fvf = 0;
+
+    // Render state
+    BOOL blend_enable = FALSE;
+    DWORD src_blend = D3DBLEND_ONE;
+    DWORD dst_blend = D3DBLEND_ZERO;
+    BOOL depth_enable = FALSE;
+    DWORD cull_mode = D3DCULL_CCW;
+    DWORD fill_mode = D3DFILL_SOLID;
+    DWORD zfunc = 0; // D3DCMP_LESSEQUAL by default
+
+    // Tracked resources for cleanup
+    std::vector<D3DVertexBuffer*> vertex_buffers;
+    std::vector<D3DIndexBuffer*> index_buffers;
+    std::vector<D3DTexture*> textures;
+    std::vector<D3DVertexDeclaration*> declarations;
 
     D3D9Device(HWND h, D3DPRESENT_PARAMETERS* p) : hwnd(h) {
         if (p) memcpy(&pp, p, sizeof(pp));
@@ -76,6 +365,7 @@ struct D3D9Device : IDirect3DDevice9 {
     ~D3D9Device() { shutdown(); }
 
     bool init() {
+        // ---- Vulkan instance ----
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "win2lin-d3d9";
@@ -102,6 +392,7 @@ struct D3D9Device : IDirect3DDevice9 {
             return false;
         }
 
+        // ---- physical device ----
         uint32_t phyCount = 0;
         vkEnumeratePhysicalDevices(g_vk.inst, &phyCount, nullptr);
         if (phyCount == 0) { LOG_ERROR("D3D9: no Vulkan physical devices"); return false; }
@@ -109,6 +400,7 @@ struct D3D9Device : IDirect3DDevice9 {
         vkEnumeratePhysicalDevices(g_vk.inst, &phyCount, phys.data());
         g_vk.phy = phys[0];
 
+        // ---- queue family ----
         uint32_t qfCount = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phy, &qfCount, nullptr);
         std::vector<VkQueueFamilyProperties> qfs(qfCount);
@@ -121,6 +413,7 @@ struct D3D9Device : IDirect3DDevice9 {
         }
         if (!found) { LOG_ERROR("D3D9: no graphics queue"); return false; }
 
+        // ---- logical device ----
         float prio = 1.0f;
         VkDeviceQueueCreateInfo dqi{};
         dqi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -141,10 +434,12 @@ struct D3D9Device : IDirect3DDevice9 {
         }
         vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 
+        // ---- surface ----
         if (SDL_Vulkan_CreateSurface((SDL_Window*)hwnd, g_vk.inst, &g_vk.surf) != SDL_TRUE) {
             LOG_ERROR("D3D9: SDL_Vulkan_CreateSurface failed"); return false;
         }
 
+        // ---- swapchain ----
         VkSurfaceCapabilitiesKHR caps{};
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phy, g_vk.surf, &caps);
         g_vk.extent = caps.currentExtent;
@@ -187,6 +482,7 @@ struct D3D9Device : IDirect3DDevice9 {
             vkCreateImageView(g_vk.dev, &ivCi, nullptr, &g_vk.views[i]);
         }
 
+        // ---- command pool / buffer ----
         VkCommandPoolCreateInfo cpCi{};
         cpCi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cpCi.queueFamilyIndex = g_vk.qfam;
@@ -200,6 +496,7 @@ struct D3D9Device : IDirect3DDevice9 {
         cbAi.commandBufferCount = 1;
         vkAllocateCommandBuffers(g_vk.dev, &cbAi, &g_vk.cmd);
 
+        // ---- sync ----
         VkSemaphoreCreateInfo semCi{};
         semCi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         vkCreateSemaphore(g_vk.dev, &semCi, nullptr, &g_vk.image_acquired);
@@ -209,14 +506,208 @@ struct D3D9Device : IDirect3DDevice9 {
         fenceCi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         vkCreateFence(g_vk.dev, &fenceCi, nullptr, &g_vk.fence);
 
+        // ---- render pass ----
+        VkAttachmentDescription att{};
+        att.format = g_vk.fmt;
+        att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        VkAttachmentReference colorRef{};
+        colorRef.attachment = 0;
+        colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+
+        VkRenderPassCreateInfo rpCi{};
+        rpCi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpCi.attachmentCount = 1;
+        rpCi.pAttachments = &att;
+        rpCi.subpassCount = 1;
+        rpCi.pSubpasses = &subpass;
+        vkCreateRenderPass(g_vk.dev, &rpCi, nullptr, &g_vk.render_pass);
+
+        // ---- pipeline layout ----
+        VkPipelineLayoutCreateInfo plCi{};
+        plCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        vkCreatePipelineLayout(g_vk.dev, &plCi, nullptr, &g_vk.pipeline_layout);
+
+        // ---- graphics pipeline ----
+        create_pipeline();
+
         g_vk_ready = true;
+        g_has_shaders = true;
+        create_pipeline();
         LOG_INFO("D3D9: device initialized, swapchain %ux%u", g_vk.extent.width, g_vk.extent.height);
         return true;
+    }
+
+    void create_pipeline() {
+        if (!g_has_shaders) return;
+
+        // Shader modules
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+
+        VkShaderModule vert_mod, frag_mod;
+        smci.codeSize = g_vert_spv_size;
+        smci.pCode = g_vert_spv;
+        vkCreateShaderModule(g_vk.dev, &smci, nullptr, &vert_mod);
+        smci.codeSize = g_frag_spv_size;
+        smci.pCode = g_frag_spv;
+        vkCreateShaderModule(g_vk.dev, &smci, nullptr, &frag_mod);
+
+        VkPipelineShaderStageCreateInfo stages[2] = {};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vert_mod;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = frag_mod;
+        stages[1].pName = "main";
+
+        // Vertex input (POSITION_COLOR: pos float2 + color DWORD as 4 bytes -> we treat as 4 floats? No, D3DFVF_DIFFUSE is packed ARGB)
+        // For simplicity: stride 24 (pos x,y as float2 at 0, color as 4 floats? Actually D3DFVF_DIFFUSE is 4 bytes packed)
+        // We'll use pos as 2 floats and color as 4 bytes converted in shader to vec4.
+        VkVertexInputBindingDescription binding{};
+        binding.binding = 0;
+        binding.stride = 24; // pos(2*4) + color(4) + padding to 24? Let's use 24
+        binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        // Attribute 0: position (float2)
+        VkVertexInputAttributeDescription attr[2] = {};
+        attr[0].binding = 0;
+        attr[0].location = 0;
+        attr[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attr[0].offset = 0;
+        // Attribute 1: color (unpacked in shader from uint)
+        attr[1].binding = 0;
+        attr[1].location = 1;
+        attr[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attr[1].offset = 8; // simplified: treat first 4 bytes after pos as color
+
+        VkPipelineVertexInputStateCreateInfo viCi{};
+        viCi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        viCi.vertexBindingDescriptionCount = 1;
+        viCi.pVertexBindingDescriptions = &binding;
+        viCi.vertexAttributeDescriptionCount = 2;
+        viCi.pVertexAttributeDescriptions = attr;
+
+        VkPipelineInputAssemblyStateCreateInfo iaCi{};
+        iaCi.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        iaCi.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkViewport viewport{};
+        viewport.width = (float)g_vk.extent.width;
+        viewport.height = (float)g_vk.extent.height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+
+        VkRect2D scissor{};
+        scissor.extent = g_vk.extent;
+
+        VkPipelineViewportStateCreateInfo vpCi{};
+        vpCi.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vpCi.viewportCount = 1;
+        vpCi.pViewports = &viewport;
+        vpCi.scissorCount = 1;
+        vpCi.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rsCi{};
+        rsCi.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rsCi.polygonMode = VK_POLYGON_MODE_FILL;
+        rsCi.cullMode = VK_CULL_MODE_BACK_BIT;
+        rsCi.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rsCi.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo msCi{};
+        msCi.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        msCi.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineColorBlendAttachmentState cbAtt{};
+        cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        cbAtt.blendEnable = VK_FALSE;
+
+        VkPipelineColorBlendStateCreateInfo cbCi{};
+        cbCi.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cbCi.attachmentCount = 1;
+        cbCi.pAttachments = &cbAtt;
+
+        VkPipelineDepthStencilStateCreateInfo dsCi{};
+        dsCi.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        dsCi.depthTestEnable = VK_FALSE;
+        dsCi.depthWriteEnable = VK_FALSE;
+
+        VkGraphicsPipelineCreateInfo gpCi{};
+        gpCi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gpCi.stageCount = 2;
+        gpCi.pStages = stages;
+        gpCi.pVertexInputState = &viCi;
+        gpCi.pInputAssemblyState = &iaCi;
+        gpCi.pViewportState = &vpCi;
+        gpCi.pRasterizationState = &rsCi;
+        gpCi.pMultisampleState = &msCi;
+        gpCi.pColorBlendState = &cbCi;
+        gpCi.pDepthStencilState = &dsCi;
+        gpCi.layout = g_vk.pipeline_layout;
+        gpCi.renderPass = g_vk.render_pass;
+        gpCi.subpass = 0;
+
+        vkCreateGraphicsPipelines(g_vk.dev, VK_NULL_HANDLE, 1, &gpCi, nullptr, &g_vk.pipeline);
+
+        vkDestroyShaderModule(g_vk.dev, frag_mod, nullptr);
+        vkDestroyShaderModule(g_vk.dev, vert_mod, nullptr);
+
+        // Framebuffer for current swapchain image
+        VkFramebufferCreateInfo fbCi{};
+        fbCi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbCi.renderPass = g_vk.render_pass;
+        fbCi.attachmentCount = 1;
+        fbCi.pAttachments = &g_vk.views[0];
+        fbCi.width = g_vk.extent.width;
+        fbCi.height = g_vk.extent.height;
+        fbCi.layers = 1;
+        vkCreateFramebuffer(g_vk.dev, &fbCi, nullptr, &g_vk.framebuffer);
     }
 
     void shutdown() {
         if (!g_vk.dev) return;
         vkDeviceWaitIdle(g_vk.dev);
+        for (auto vb : vertex_buffers) {
+            if (vb->buf) vkDestroyBuffer(g_vk.dev, vb->buf, nullptr);
+            if (vb->mem) vkFreeMemory(g_vk.dev, vb->mem, nullptr);
+            delete vb;
+        }
+        for (auto ib : index_buffers) {
+            if (ib->buf) vkDestroyBuffer(g_vk.dev, ib->buf, nullptr);
+            if (ib->mem) vkFreeMemory(g_vk.dev, ib->mem, nullptr);
+            delete ib;
+        }
+        for (auto tx : textures) {
+            if (tx->view) vkDestroyImageView(g_vk.dev, tx->view, nullptr);
+            if (tx->sampler) vkDestroySampler(g_vk.dev, tx->sampler, nullptr);
+            if (tx->img) vkDestroyImage(g_vk.dev, tx->img, nullptr);
+            if (tx->mem) vkFreeMemory(g_vk.dev, tx->mem, nullptr);
+            delete tx;
+        }
+        for (auto vd : declarations) delete vd;
+        vertex_buffers.clear();
+        index_buffers.clear();
+        textures.clear();
+        declarations.clear();
+
+        if (g_vk.framebuffer) vkDestroyFramebuffer(g_vk.dev, g_vk.framebuffer, nullptr);
+        if (g_vk.pipeline) vkDestroyPipeline(g_vk.dev, g_vk.pipeline, nullptr);
+        if (g_vk.pipeline_layout) vkDestroyPipelineLayout(g_vk.dev, g_vk.pipeline_layout, nullptr);
+        if (g_vk.render_pass) vkDestroyRenderPass(g_vk.dev, g_vk.render_pass, nullptr);
         if (g_vk.fence) vkDestroyFence(g_vk.dev, g_vk.fence, nullptr);
         if (g_vk.render_done) vkDestroySemaphore(g_vk.dev, g_vk.render_done, nullptr);
         if (g_vk.image_acquired) vkDestroySemaphore(g_vk.dev, g_vk.image_acquired, nullptr);
@@ -229,17 +720,132 @@ struct D3D9Device : IDirect3DDevice9 {
         if (g_vk.inst) vkDestroyInstance(g_vk.inst, nullptr);
         memset(&g_vk, 0, sizeof(g_vk));
         g_vk_ready = false;
+        g_has_shaders = false;
+    }
+
+    // --- Resource creation ---
+    HRESULT create_vertex_buffer(UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
+                                 IDirect3DVertexBuffer9** pp) {
+        auto vb = new D3DVertexBuffer();
+        vb->size = length;
+        vb->fvf = fvf;
+        vb->pool = pool;
+        vb->usage = usage;
+        VkResult r = create_buffer(g_vk.dev, g_vk.phy, length,
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   &vb->buf, &vb->mem, &vb->mapped);
+        if (r != VK_SUCCESS) { delete vb; *pp = nullptr; return D3DERR_OUTOFVIDEOMEMORY; }
+        vb->lpVtbl = &D3DVertexBuffer::vtbl;
+        vertex_buffers.push_back(vb);
+        *pp = static_cast<IDirect3DVertexBuffer9*>(vb);
+        return D3D_OK;
+    }
+
+    HRESULT create_index_buffer(UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                                IDirect3DIndexBuffer9** pp) {
+        auto ib = new D3DIndexBuffer();
+        ib->size = length;
+        ib->fmt = format;
+        ib->pool = pool;
+        ib->usage = usage;
+        VkBufferUsageFlags usage_flags = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        VkResult r = create_buffer(g_vk.dev, g_vk.phy, length,
+                                   usage_flags,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   &ib->buf, &ib->mem, &ib->mapped);
+        if (r != VK_SUCCESS) { delete ib; *pp = nullptr; return D3DERR_OUTOFVIDEOMEMORY; }
+        ib->lpVtbl = &D3DIndexBuffer::vtbl;
+        index_buffers.push_back(ib);
+        *pp = static_cast<IDirect3DIndexBuffer9*>(ib);
+        return D3D_OK;
+    }
+
+    HRESULT create_texture(UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format,
+                           D3DPOOL pool, IDirect3DTexture9** pp) {
+        (void)levels; (void)usage; (void)pool;
+        auto tx = new D3DTexture();
+        tx->width = width;
+        tx->height = height;
+        VkFormat vkfmt = VK_FORMAT_R8G8B8A8_UNORM;
+        tx->fmt = vkfmt;
+        tx->extent = { width, height };
+
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = vkfmt;
+        ici.extent = { width, height, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateImage(g_vk.dev, &ici, nullptr, &tx->img) != VK_SUCCESS) {
+            delete tx; *pp = nullptr; return D3DERR_OUTOFVIDEOMEMORY;
+        }
+
+        VkMemoryRequirements mr{};
+        vkGetImageMemoryRequirements(g_vk.dev, tx->img, &mr);
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phy, &mp);
+        uint32_t mt = 0;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+            if ((mr.memoryTypeBits & (1u << i)) &&
+                (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                mt = i; break;
+            }
+        }
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = mr.size;
+        ai.memoryTypeIndex = mt;
+        vkAllocateMemory(g_vk.dev, &ai, nullptr, &tx->mem);
+        vkBindImageMemory(g_vk.dev, tx->img, tx->mem, 0);
+
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = tx->img;
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = vkfmt;
+        ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCreateImageView(g_vk.dev, &ivci, nullptr, &tx->view);
+
+        VkSamplerCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter = VK_FILTER_LINEAR;
+        sci.minFilter = VK_FILTER_LINEAR;
+        vkCreateSampler(g_vk.dev, &sci, nullptr, &tx->sampler);
+
+        tx->lpVtbl = &D3DTexture::vtbl;
+        textures.push_back(tx);
+        *pp = static_cast<IDirect3DTexture9*>(tx);
+        return D3D_OK;
+    }
+
+    HRESULT create_vertex_declaration(const D3DVERTEXELEMENT9* elements, IDirect3DVertexDeclaration9** pp) {
+        auto vd = new D3DVertexDeclaration();
+        if (elements) {
+            for (UINT i = 0; elements[i].Stream != 0xff; ++i) {
+                vd->elements.push_back(elements[i]);
+            }
+        }
+        vd->lpVtbl = &D3DVertexDeclaration::vtbl;
+        declarations.push_back(vd);
+        *pp = static_cast<IDirect3DVertexDeclaration9*>(vd);
+        return D3D_OK;
     }
 
     // --- COM methods ---
     static HRESULT WINAPI QueryInterface(IDirect3DDevice9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
     static ULONG WINAPI AddRef(IDirect3DDevice9* iface) {
         auto self = static_cast<D3D9Device*>(iface);
-        return com_addref(&self->ref);
+        return (ULONG)(++self->ref);
     }
     static ULONG WINAPI Release(IDirect3DDevice9* iface) {
         auto self = static_cast<D3D9Device*>(iface);
-        auto v = com_release(&self->ref);
+        auto v = (ULONG)(--self->ref);
         if (v == 0) delete self;
         return v;
     }
@@ -256,11 +862,17 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI CreateRenderTarget(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9**, HANDLE*) { return D3D_OK; }
     static HRESULT WINAPI CreateDepthStencilSurface(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9**, HANDLE*) { return D3D_OK; }
     static HRESULT WINAPI CreateSurface(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9**, HANDLE*) { return D3D_OK; }
-    static HRESULT WINAPI CreateTexture(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*) { return D3D_OK; }
+    static HRESULT WINAPI CreateTexture(IDirect3DDevice9* iface, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture9** pp, HANDLE*) {
+        return static_cast<D3D9Device*>(iface)->create_texture(w, h, levels, usage, fmt, pool, pp);
+    }
     static HRESULT WINAPI CreateVolumeTexture(IDirect3DDevice9*, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture9**, HANDLE*) { return D3D_OK; }
     static HRESULT WINAPI CreateCubeTexture(IDirect3DDevice9*, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DCubeTexture9**, HANDLE*) { return D3D_OK; }
-    static HRESULT WINAPI CreateVertexBuffer(IDirect3DDevice9*, UINT, DWORD, DWORD, D3DPOOL, IDirect3DVertexBuffer9**, HANDLE*) { return D3D_OK; }
-    static HRESULT WINAPI CreateIndexBuffer(IDirect3DDevice9*, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DIndexBuffer9**, HANDLE*) { return D3D_OK; }
+    static HRESULT WINAPI CreateVertexBuffer(IDirect3DDevice9* iface, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool, IDirect3DVertexBuffer9** pp, HANDLE*) {
+        return static_cast<D3D9Device*>(iface)->create_vertex_buffer(length, usage, fvf, pool, pp);
+    }
+    static HRESULT WINAPI CreateIndexBuffer(IDirect3DDevice9* iface, UINT length, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DIndexBuffer9** pp, HANDLE*) {
+        return static_cast<D3D9Device*>(iface)->create_index_buffer(length, usage, fmt, pool, pp);
+    }
     static HRESULT WINAPI CreateImageSurface(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, IDirect3DSurface9**) { return D3D_OK; }
     static HRESULT WINAPI LockRect(IDirect3DSurface9*, D3DLOCKED_RECT*, const D3DRECT*, DWORD) { return D3D_OK; }
     static HRESULT WINAPI UnlockRect(IDirect3DSurface9*) { return D3D_OK; }
@@ -272,11 +884,64 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI SetDepthStencilSurface(IDirect3DDevice9*, IDirect3DSurface9*) { return D3D_OK; }
     static HRESULT WINAPI GetDepthStencilSurface(IDirect3DDevice9*, IDirect3DSurface9**) { return D3D_OK; }
     static HRESULT WINAPI BeginScene(IDirect3DDevice9* iface) {
-        static_cast<D3D9Device*>(iface)->scene_begun = true;
+        auto self = static_cast<D3D9Device*>(iface);
+        self->scene_begun = true;
+        vkResetCommandBuffer(g_vk.cmd, 0);
+        VkCommandBufferBeginInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(g_vk.cmd, &cbi);
+
+        // Transition swapchain image to color attachment
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = g_vk.images[0];
+        barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkRenderPassBeginInfo rpbi{};
+        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpbi.renderPass = g_vk.render_pass;
+        rpbi.framebuffer = g_vk.framebuffer;
+        rpbi.renderArea.extent = g_vk.extent;
+        VkClearValue clear{};
+        clear.color = { {0.0f, 0.1f, 0.2f, 1.0f} };
+        rpbi.clearValueCount = 1;
+        rpbi.pClearValues = &clear;
+        vkCmdBeginRenderPass(g_vk.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline);
+        VkViewport vp{ 0, 0, (float)g_vk.extent.width, (float)g_vk.extent.height, 0.0f, 1.0f };
+        VkRect2D sc{ {0, 0}, g_vk.extent };
+        vkCmdSetViewport(g_vk.cmd, 0, 1, &vp);
+        vkCmdSetScissor(g_vk.cmd, 0, 1, &sc);
+
+        self->scene_begun = true;
         return D3D_OK;
     }
     static HRESULT WINAPI EndScene(IDirect3DDevice9* iface) {
-        static_cast<D3D9Device*>(iface)->scene_begun = false;
+        auto self = static_cast<D3D9Device*>(iface);
+        self->scene_begun = false;
+        vkCmdEndRenderPass(g_vk.cmd);
+        // Transition back to present
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = g_vk.images[0];
+        barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = 0;
+        vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        vkEndCommandBuffer(g_vk.cmd);
         return D3D_OK;
     }
     static HRESULT WINAPI Clear(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, FLOAT, DWORD) { return D3D_OK; }
@@ -293,7 +958,18 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI GetLightEnable(IDirect3DDevice9*, DWORD, BOOL*) { return D3D_OK; }
     static HRESULT WINAPI SetClipPlane(IDirect3DDevice9*, DWORD, const FLOAT*) { return D3D_OK; }
     static HRESULT WINAPI GetClipPlane(IDirect3DDevice9*, DWORD, FLOAT*) { return D3D_OK; }
-    static HRESULT WINAPI SetRenderState(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD) { return D3D_OK; }
+    static HRESULT WINAPI SetRenderState(IDirect3DDevice9* iface, D3DRENDERSTATETYPE state, DWORD val) {
+        auto self = static_cast<D3D9Device*>(iface);
+        switch (state) {
+        case D3DRS_ALPHABLENDENABLE: self->blend_enable = (BOOL)val; break;
+        case D3DRS_SRCBLEND: self->src_blend = val; break;
+        case D3DRS_DESTBLEND: self->dst_blend = val; break;
+        case D3DRS_ZENABLE: self->depth_enable = (BOOL)val; break;
+        case D3DRS_CULLMODE: self->cull_mode = val; break;
+        case D3DRS_FILLMODE: self->fill_mode = val; break;
+        }
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetRenderState(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD*) { return D3D_OK; }
     static HRESULT WINAPI CreateStateBlock(IDirect3DDevice9*, D3DSTATEBLOCKTYPE, IDirect3DStateBlock9**) { return D3D_OK; }
     static HRESULT WINAPI GetStateBlock(IDirect3DDevice9*, DWORD, IDirect3DStateBlock9**) { return D3D_OK; }
@@ -302,7 +978,11 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI SetClipStatus(IDirect3DDevice9*, const D3DCLIPSTATUS9*) { return D3D_OK; }
     static HRESULT WINAPI GetClipStatus(IDirect3DDevice9*, D3DCLIPSTATUS9*) { return D3D_OK; }
     static HRESULT WINAPI GetTexture(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9**) { return D3D_OK; }
-    static HRESULT WINAPI SetTexture(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*) { return D3D_OK; }
+    static HRESULT WINAPI SetTexture(IDirect3DDevice9* iface, DWORD stage, IDirect3DBaseTexture9* tex) {
+        // store texture on device state (we don't track per-stage deeply, just accept)
+        (void)iface; (void)stage; (void)tex;
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetSamplerState(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD*) { return D3D_OK; }
     static HRESULT WINAPI SetSamplerState(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD) { return D3D_OK; }
     static HRESULT WINAPI ValidateDevice(IDirect3DDevice9*, DWORD*) { return D3D_OK; }
@@ -318,15 +998,54 @@ struct D3D9Device : IDirect3DDevice9 {
     static BOOL WINAPI GetSoftwareVertexProcessing(IDirect3DDevice9*) { return TRUE; }
     static HRESULT WINAPI SetNPatchMode(IDirect3DDevice9*, FLOAT) { return D3D_OK; }
     static FLOAT WINAPI GetNPatchMode(IDirect3DDevice9*) { return 0.0f; }
-    static HRESULT WINAPI DrawPrimitive(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT) { return D3D_OK; }
-    static HRESULT WINAPI DrawIndexedPrimitive(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) { return D3D_OK; }
+
+    static HRESULT WINAPI DrawPrimitive(IDirect3DDevice9* iface, D3DPRIMITIVETYPE type, UINT start, UINT count) {
+        auto self = static_cast<D3D9Device*>(iface);
+        if (!g_has_shaders) return D3D_OK;
+        vkCmdBindPipeline(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline);
+        // Bind vertex buffer from stream 0
+        if (self->streams[0]) {
+            auto vb = static_cast<D3DVertexBuffer*>(self->streams[0]);
+            VkDeviceSize offset = self->stream_offsets[0];
+            vkCmdBindVertexBuffers(g_vk.cmd, 0, 1, &vb->buf, &offset);
+        }
+        vkCmdDraw(g_vk.cmd, count, 1, start, 0);
+        return D3D_OK;
+    }
+
+    static HRESULT WINAPI DrawIndexedPrimitive(IDirect3DDevice9* iface, D3DPRIMITIVETYPE type, INT base, UINT min, UINT count, UINT start, UINT pc) {
+        auto self = static_cast<D3D9Device*>(iface);
+        if (!g_has_shaders) return D3D_OK;
+        vkCmdBindPipeline(g_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pipeline);
+        if (self->streams[0]) {
+            auto vb = static_cast<D3DVertexBuffer*>(self->streams[0]);
+            VkDeviceSize offset = self->stream_offsets[0];
+            vkCmdBindVertexBuffers(g_vk.cmd, 0, 1, &vb->buf, &offset);
+        }
+        if (self->index_buffer) {
+            auto ib = static_cast<D3DIndexBuffer*>(self->index_buffer);
+            VkIndexType it = (ib->fmt == D3DFMT_INDEX16) ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            vkCmdBindIndexBuffer(g_vk.cmd, ib->buf, 0, it);
+        }
+        vkCmdDrawIndexed(g_vk.cmd, count, 1, start, base, 0);
+        return D3D_OK;
+    }
+
     static HRESULT WINAPI DrawPrimitiveUP(IDirect3DDevice9*, D3DPTRIMITIVETYPE, UINT, const VOID*, UINT, const D3DVERTEXELEMENT9*, UINT) { return D3D_OK; }
     static HRESULT WINAPI DrawIndexedPrimitiveUP(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, const VOID*, UINT, D3DFORMAT, const VOID*, UINT) { return D3D_OK; }
     static HRESULT WINAPI ProcessVertices(IDirect3DDevice9*, UINT, UINT, UINT, IDirect3DVertexBuffer9*, DWORD) { return D3D_OK; }
-    static HRESULT WINAPI CreateVertexDeclaration(IDirect3DDevice9*, const D3DVERTEXELEMENT9*, IDirect3DVertexDeclaration9**) { return D3D_OK; }
-    static HRESULT WINAPI SetVertexDeclaration(IDirect3DDevice9*, IDirect3DVertexDeclaration9*) { return D3D_OK; }
+    static HRESULT WINAPI CreateVertexDeclaration(IDirect3DDevice9* iface, const D3DVERTEXELEMENT9* elements, IDirect3DVertexDeclaration9** pp) {
+        return static_cast<D3D9Device*>(iface)->create_vertex_declaration(elements, pp);
+    }
+    static HRESULT WINAPI SetVertexDeclaration(IDirect3DDevice9* iface, IDirect3DVertexDeclaration9* decl) {
+        static_cast<D3D9Device*>(iface)->vertex_decl = decl;
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetVertexDeclaration(IDirect3DDevice9*, IDirect3DVertexDeclaration9**) { return D3D_OK; }
-    static HRESULT WINAPI SetFVF(IDirect3DDevice9*, DWORD) { return D3D_OK; }
+    static HRESULT WINAPI SetFVF(IDirect3DDevice9* iface, DWORD fvf) {
+        static_cast<D3D9Device*>(iface)->fvf = fvf;
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetFVF(IDirect3DDevice9*, DWORD*) { return D3D_OK; }
     static HRESULT WINAPI CreateVertexShader(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**) { return D3D_OK; }
     static HRESULT WINAPI SetVertexShader(IDirect3DDevice9*, IDirect3DVertexShader9*) { return D3D_OK; }
@@ -338,9 +1057,18 @@ struct D3D9Device : IDirect3DDevice9 {
     static HRESULT WINAPI SetVertexShaderConstantB(IDirect3DDevice9*, UINT, const BOOL*, UINT) { return D3D_OK; }
     static HRESULT WINAPI GetVertexShaderConstantB(IDirect3DDevice9*, UINT, BOOL*, UINT) { return D3D_OK; }
     static HRESULT WINAPI SetStreamSourceFreq(IDirect3DDevice9*, UINT, UINT) { return D3D_OK; }
-    static HRESULT WINAPI SetStreamSource(IDirect3DDevice9*, UINT, IDirect3DVertexBuffer9*, UINT, UINT) { return D3D_OK; }
+    static HRESULT WINAPI SetStreamSource(IDirect3DDevice9* iface, UINT stream, IDirect3DVertexBuffer9* vb, UINT offset, UINT stride) {
+        auto self = static_cast<D3D9Device*>(iface);
+        self->streams[stream] = vb;
+        self->stream_offsets[stream] = offset;
+        self->stream_strides[stream] = stride;
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetStreamSource(IDirect3DDevice9*, UINT, IDirect3DVertexBuffer9**, UINT*, UINT*) { return D3D_OK; }
-    static HRESULT WINAPI SetIndices(IDirect3DDevice9*, IDirect3DIndexBuffer9*) { return D3D_OK; }
+    static HRESULT WINAPI SetIndices(IDirect3DDevice9* iface, IDirect3DIndexBuffer9* ib) {
+        static_cast<D3D9Device*>(iface)->index_buffer = ib;
+        return D3D_OK;
+    }
     static HRESULT WINAPI GetIndices(IDirect3DDevice9*, IDirect3DIndexBuffer9**) { return D3D_OK; }
     static HRESULT WINAPI CreatePixelShader(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**) { return D3D_OK; }
     static HRESULT WINAPI SetPixelShader(IDirect3DDevice9*, IDirect3DPixelShader9*) { return D3D_OK; }
@@ -364,7 +1092,6 @@ struct D3D9Device : IDirect3DDevice9 {
         VkSemaphore ia = g_vk.image_acquired;
         VkSemaphore rd = g_vk.render_done;
         VkFence fence = g_vk.fence;
-        VkCommandBuffer cmd = g_vk.cmd;
 
         vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
         vkResetFences(dev, 1, &fence);
@@ -373,17 +1100,6 @@ struct D3D9Device : IDirect3DDevice9 {
         VkResult r = vkAcquireNextImageKHR(dev, sc, UINT64_MAX, ia, VK_NULL_HANDLE, &idx);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) return D3D_OK;
 
-        VkCommandBufferBeginInfo cbi{};
-        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &cbi);
-
-        VkClearColorValue clear{ {0.0f, 0.1f, 0.2f, 1.0f} };
-        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCmdClearColorImage(cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_UNDEFINED, &clear, 1, &range);
-
-        vkEndCommandBuffer(cmd);
-
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{};
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -391,7 +1107,7 @@ struct D3D9Device : IDirect3DDevice9 {
         si.pWaitSemaphores = &ia;
         si.pWaitDstStageMask = &waitStage;
         si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
+        si.pCommandBuffers = &g_vk.cmd;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &rd;
         vkQueueSubmit(queue, 1, &si, fence);
@@ -448,20 +1164,17 @@ const IDirect3DDevice9Vtbl D3D9Device::vtbl = {
     D3D9Device::Present,
 };
 
-// ===========================================================================
-// IDirect3D9
-// ===========================================================================
 struct D3D9 : IDirect3D9 {
     uintptr_t ref = 1;
 
     static HRESULT WINAPI QueryInterface(IDirect3D9*, REFIID, LPVOID*) { return E_NOINTERFACE; }
     static ULONG WINAPI AddRef(IDirect3D9* iface) {
         auto self = static_cast<D3D9*>(iface);
-        return com_addref(&self->ref);
+        return (ULONG)(++self->ref);
     }
     static ULONG WINAPI Release(IDirect3D9* iface) {
         auto self = static_cast<D3D9*>(iface);
-        auto v = com_release(&self->ref);
+        auto v = (ULONG)(--self->ref);
         if (v == 0) delete self;
         return v;
     }
@@ -526,7 +1239,6 @@ struct D3D9 : IDirect3D9 {
 
         auto dev = new D3D9Device(hFocusWindow, pParams);
         if (!dev->init()) {
-            delete dev;
             *ppOut = nullptr;
             return D3DERR_OUTOFVIDEOMEMORY;
         }

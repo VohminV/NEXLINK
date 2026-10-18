@@ -72,6 +72,15 @@ struct GUID {
     WORD Data3;
     BYTE Data4[8];
 };
+using REFGUID = const GUID*;
+
+// RECT (Windows-style)
+struct RECT {
+    LONG left;
+    LONG top;
+    LONG right;
+    LONG bottom;
+};
 
 // D3DFORMAT
 enum D3DFORMAT : DWORD {
@@ -97,6 +106,8 @@ enum D3DFORMAT : DWORD {
     D3DFMT_P8 = 41,
     D3DFMT_L8 = 50,
     D3DFMT_L8R8 = 51,
+    D3DFMT_INDEX16 = 36,
+    D3DFMT_INDEX32 = 37,
     D3DFMT_L16 = 81,
     D3DFMT_V8U8 = 82,
     D3DFMT_L6V5U5 = 83,
@@ -702,6 +713,162 @@ struct IDirect3DDevice9Vtbl {
 
 struct IDirect3DDevice9 {
     const IDirect3DDevice9Vtbl* lpVtbl;
+};
+
+// ===========================================================================
+// D3D9 Resources
+// ===========================================================================
+
+#define D3DFVF_XYZ               0x002
+#define D3DFVF_XYZRHW            0x004
+#define D3DFVF_NORMAL            0x0010
+#define D3DFVF_DIFFUSE           0x0040
+#define D3DFVF_SPECULAR          0x0080
+#define D3DFVF_TEXTURE1          0x0100
+#define D3DFVF_TEXCOUNT_MASK     0x0f00
+#define D3DFVF_TEXCOUNT_SHIFT    8
+
+#define D3DFVF_POSITION          (D3DFVF_XYZ)
+#define D3DFVF_POSITION_COLOR    (D3DFVF_XYZ | D3DFVF_DIFFUSE)
+
+struct D3DVERTEXBUFFER_DESC {
+    D3DPOOL Pool;
+    UINT Size;
+    DWORD Usage;
+    DWORD FVF;
+};
+
+struct D3DINDEXBUFFER_DESC {
+    D3DPOOL Pool;
+    UINT Size;
+    DWORD Usage;
+    D3DFORMAT Format;
+};
+
+// IDirect3DVertexBuffer9
+struct IDirect3DVertexBuffer9Vtbl {
+    HRESULT (WINAPI *QueryInterface)(IDirect3DVertexBuffer9*, REFIID, LPVOID*);
+    ULONG (WINAPI *AddRef)(IDirect3DVertexBuffer9*);
+    ULONG (WINAPI *Release)(IDirect3DVertexBuffer9*);
+    HRESULT (WINAPI *Lock)(IDirect3DVertexBuffer9*, UINT, UINT, LPVOID*, DWORD);
+    HRESULT (WINAPI *Unlock)(IDirect3DVertexBuffer9*);
+    HRESULT (WINAPI *GetDesc)(IDirect3DVertexBuffer9*, D3DVERTEXBUFFER_DESC*);
+    HRESULT (WINAPI *PreLoad)(IDirect3DVertexBuffer9*);
+    HRESULT (WINAPI *SetPriority)(IDirect3DVertexBuffer9*, DWORD);
+    HRESULT (WINAPI *GetPriority)(IDirect3DVertexBuffer9*, DWORD*);
+    HRESULT (WINAPI *SetProperties)(IDirect3DVertexBuffer9*, DWORD);
+    HRESULT (WINAPI *GetProperties)(IDirect3DVertexBuffer9*, DWORD*);
+};
+struct IDirect3DVertexBuffer9 {
+    const IDirect3DVertexBuffer9Vtbl* lpVtbl;
+};
+
+// IDirect3DIndexBuffer9
+struct IDirect3DIndexBuffer9Vtbl {
+    HRESULT (WINAPI *QueryInterface)(IDirect3DIndexBuffer9*, REFIID, LPVOID*);
+    ULONG (WINAPI *AddRef)(IDirect3DIndexBuffer9*);
+    ULONG (WINAPI *Release)(IDirect3DIndexBuffer9*);
+    HRESULT (WINAPI *Lock)(IDirect3DIndexBuffer9*, UINT, UINT, LPVOID*, DWORD);
+    HRESULT (WINAPI *Unlock)(IDirect3DIndexBuffer9*);
+    HRESULT (WINAPI *GetDesc)(IDirect3DIndexBuffer9*, D3DINDEXBUFFER_DESC*);
+    HRESULT (WINAPI *PreLoad)(IDirect3DIndexBuffer9*);
+};
+struct IDirect3DIndexBuffer9 {
+    const IDirect3DIndexBuffer9Vtbl* lpVtbl;
+};
+
+// IDirect3DTexture9
+struct IDirect3DTexture9Vtbl {
+    HRESULT (WINAPI *QueryInterface)(IDirect3DTexture9*, REFIID, LPVOID*);
+    ULONG (WINAPI *AddRef)(IDirect3DTexture9*);
+    ULONG (WINAPI *Release)(IDirect3DTexture9*);
+    HRESULT (WINAPI *GetDevice)(IDirect3DTexture9*, IDirect3DDevice9**);
+    HRESULT (WINAPI *SetPrivateData)(IDirect3DTexture9*, REFGUID, const void*, DWORD, DWORD);
+    HRESULT (WINAPI *GetPrivateData)(IDirect3DTexture9*, REFGUID, void*, DWORD*);
+    HRESULT (WINAPI *FreePrivateData)(IDirect3DTexture9*, REFGUID);
+    HRESULT (WINAPI *SetPriority)(IDirect3DTexture9*, DWORD);
+    HRESULT (WINAPI *GetPriority)(IDirect3DTexture9*, DWORD*);
+    HRESULT (WINAPI *PreLoad)(IDirect3DTexture9*);
+    HRESULT (WINAPI *GetType)(IDirect3DTexture9*, D3DRESOURCETYPE*);
+    DWORD (WINAPI *SetLOD)(IDirect3DTexture9*, DWORD);
+    DWORD (WINAPI *GetLOD)(IDirect3DTexture9*);
+    DWORD (WINAPI *GetLevelCount)(IDirect3DTexture9*);
+    HRESULT (WINAPI *SetAutoGenFilterType)(IDirect3DTexture9*, D3DTEXTUREFILTERTYPE);
+    HRESULT (WINAPI *GetAutoGenFilterType)(IDirect3DTexture9*, D3DTEXTUREFILTERTYPE*);
+    HRESULT (WINAPI *GenerateMipSubLevels)(IDirect3DTexture9*);
+    HRESULT (WINAPI *LockRect)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
+    HRESULT (WINAPI *UnlockRect)(IDirect3DTexture9*, UINT);
+    HRESULT (WINAPI *AddDirtyRect)(IDirect3DTexture9*, const RECT*);
+};
+struct IDirect3DTexture9 {
+    const IDirect3DTexture9Vtbl* lpVtbl;
+};
+
+// IDirect3DVertexDeclaration9
+struct IDirect3DVertexDeclaration9Vtbl {
+    HRESULT (WINAPI *QueryInterface)(IDirect3DVertexDeclaration9*, REFIID, LPVOID*);
+    ULONG (WINAPI *AddRef)(IDirect3DVertexDeclaration9*);
+    ULONG (WINAPI *Release)(IDirect3DVertexDeclaration9*);
+    HRESULT (WINAPI *GetDevice)(IDirect3DVertexDeclaration9*, IDirect3DDevice9*);
+    HRESULT (WINAPI *GetDeclaration)(IDirect3DVertexDeclaration9*, D3DVERTEXELEMENT9*, UINT*);
+};
+struct IDirect3DVertexDeclaration9 {
+    const IDirect3DVertexDeclaration9Vtbl* lpVtbl;
+};
+
+// Render state additions
+enum {
+    D3DRS_COLORWRITEENABLE = 148,
+};
+
+// Texture stage states
+enum D3DTEXTURESTAGESTATETYPE : DWORD {
+    D3DTSS_COLOROP = 1,
+    D3DTSS_COLORARG1 = 2,
+    D3DTSS_COLORARG2 = 3,
+    D3DTSS_ALPHAOP = 4,
+    D3DTSS_ALPHAARG1 = 6,
+    D3DTSS_ALPHAARG2 = 7,
+    D3DTSS_TEXCOORDINDEX = 8,
+    D3DTSS_TEXTURE = 14,
+};
+
+enum D3DTEXTUREOP : DWORD {
+    D3DTOP_DISABLE = 1,
+    D3DTOP_SELECTARG1 = 2,
+    D3DTOP_MODULATE = 3,
+};
+
+enum {
+    D3DTA_TEXTURE = 0,
+    D3DTA_DIFFUSE = 1,
+    D3DTA_CURRENT = 2,
+};
+
+// Blend
+enum D3DBLEND : DWORD {
+    D3DBLEND_ZERO = 1,
+    D3DBLEND_ONE = 2,
+    D3DBLEND_SRCCOLOR = 3,
+    D3DBLEND_INVSRCCOLOR = 4,
+    D3DBLEND_SRCALPHA = 5,
+    D3DBLEND_INVSRCALPHA = 6,
+    D3DBLEND_DESTALPHA = 7,
+    D3DBLEND_INVDESTALPHA = 8,
+};
+
+// Cull
+enum D3DCULL : DWORD {
+    D3DCULL_NONE = 1,
+    D3DCULL_CW = 2,
+    D3DCULL_CCW = 3,
+};
+
+// Fill
+enum D3DFILL : DWORD {
+    D3DFILL_POINT = 1,
+    D3DFILL_WIREFRAME = 2,
+    D3DFILL_SOLID = 3,
 };
 
 // Exported entry point
