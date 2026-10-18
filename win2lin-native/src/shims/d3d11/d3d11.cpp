@@ -17,6 +17,7 @@
 #include "common/com_base.h"
 #include "vulkan_backend.h"
 #include "stub_shaders.h"
+#include "shaders/shader_cache.h"
 
 #include <dlfcn.h>
 
@@ -29,6 +30,9 @@
 using namespace win2lin::win;
 using namespace win2lin::com;
 namespace d3d11vk = win2lin::d3d11vk;
+namespace shaders = win2lin::shaders;
+
+static shaders::ShaderCache g_shaderCache;
 
 namespace {
 
@@ -182,6 +186,8 @@ constexpr UINT DXGI_FORMAT_R8G8B8A8_UNORM_ = 28;
 constexpr UINT DXGI_FORMAT_R32G32B32_FLOAT_ = 6;
 constexpr UINT DXGI_FORMAT_R32G32_FLOAT_ = 16;
 constexpr UINT DXGI_FORMAT_R32G32B32A32_FLOAT_ = 2;
+constexpr UINT DXGI_FORMAT_R16_UINT_ = 57;
+constexpr UINT DXGI_FORMAT_R32_UINT_ = 42;
 constexpr UINT D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ = 4;
 constexpr UINT D3D11_APPEND_ALIGNED_ELEMENT_ = 0xffffffff;
 
@@ -1007,6 +1013,14 @@ public:
     void set_ppm_path(const char* path) { ppm_path_ = path ? path : "triangle.ppm"; }
     void set_context(MockD3D11DeviceContext* ctx) { context_ = ctx; }
 
+    ~MockDXGISwapChain() {
+        // Retire pending presents and destroy the VkSwapchainKHR while the
+        // SDL/X11 window is still alive: destroying the window first leaves
+        // in-flight presents that make SDL_DestroyWindow() and
+        // vkDestroySwapchainKHR() stall for seconds in the driver.
+        d3d11vk::backend().shutdown_swapchain();
+    }
+
 private:
     std::string ppm_path_ = "triangle.ppm";
     MockD3D11DeviceContext* context_ = nullptr;
@@ -1174,6 +1188,25 @@ public:
         }
     }
 
+    // ---- Constant buffers (Phase 5) ----------------------------------------
+    void WINAPI VSSetConstantBuffers(UINT StartSlot, UINT NumBuffers,
+                                     ID3D11Buffer* const* ppBuffers) override {
+        for (UINT i = 0; i < NumBuffers && StartSlot + i < kMaxConstantBuffers; ++i) {
+            vs_cb_[StartSlot + i] = ppBuffers ? ppBuffers[i] : nullptr;
+        }
+        dset_dirty_ = true;
+        D3D11_INFO("VSSetConstantBuffers(%u, %u)", StartSlot, NumBuffers);
+    }
+
+    void WINAPI PSSetConstantBuffers(UINT StartSlot, UINT NumBuffers,
+                                     ID3D11Buffer* const* ppBuffers) override {
+        for (UINT i = 0; i < NumBuffers && StartSlot + i < kMaxConstantBuffers; ++i) {
+            ps_cb_[StartSlot + i] = ppBuffers ? ppBuffers[i] : nullptr;
+        }
+        dset_dirty_ = true;
+        D3D11_INFO("PSSetConstantBuffers(%u, %u)", StartSlot, NumBuffers);
+    }
+
     // ---- UpdateSubresource (texture upload) --------------------------------
     void WINAPI UpdateSubresource(ID3D11Resource* pResource, UINT,
                                   const D3D11_BOX*, const void* pSrcData,
@@ -1225,6 +1258,8 @@ public:
         om_depth_stencil_ = nullptr;
         om_blend_state_ = nullptr;
         om_depth_stencil_state_ = nullptr;
+        for (auto& cb : vs_cb_) cb = nullptr;
+        for (auto& cb : ps_cb_) cb = nullptr;
         pending_draws_.clear();
         dirty_ = true;
         dset_dirty_ = true;
@@ -1249,8 +1284,11 @@ private:
     bool ensure_descriptor_set();
 
     struct DrawCall {
-        UINT vertex_count;
-        UINT start_vertex;
+        bool indexed;
+        UINT vertex_count;      // Draw: VertexCount; DrawIndexed: IndexCount
+        UINT start_vertex;      // Draw: StartVertexLocation; DrawIndexed: StartIndexLocation
+        INT base_vertex;        // DrawIndexed: BaseVertexLocation (unused in Draw)
+        UINT instance_count;    // 1 for non-instanced
     };
 
     // Input assembler state.
@@ -1269,6 +1307,11 @@ private:
     ID3D11PixelShader* ps_shader_ = nullptr;
     MockD3D11ShaderResourceView* ps_srv_ = nullptr;
     MockD3D11SamplerState* ps_sampler_ = nullptr;
+
+    // Constant buffers (Phase 5): vs_cb_[slot], ps_cb_[slot].
+    static constexpr UINT kMaxConstantBuffers = 4;
+    ID3D11Buffer* vs_cb_[kMaxConstantBuffers] = {};
+    ID3D11Buffer* ps_cb_[kMaxConstantBuffers] = {};
 
     // Rasterizer / blend / depth-stencil state.
     MockD3D11RasterizerState* rs_state_ = nullptr;
@@ -1352,10 +1395,33 @@ public:
         }
 
         if (pInitialData) {
-            void* dst = d3d11vk::backend().map_buffer(&vk_buf);
-            if (dst) {
-                std::memcpy(dst, pInitialData, pDesc->ByteWidth);
-                d3d11vk::backend().unmap_buffer(&vk_buf);
+            // If the buffer is host-visible, map directly; otherwise use a
+            // staging buffer + one-shot copy (device-local memory can't be mapped).
+            bool direct = true; // TEMP-BISECT: force direct map
+            if (direct) {
+                void* dst = d3d11vk::backend().map_buffer(&vk_buf);
+                if (dst) {
+                    std::memcpy(dst, pInitialData, pDesc->ByteWidth);
+                    d3d11vk::backend().unmap_buffer(&vk_buf);
+                }
+            } else {
+                // Staging buffer (host-visible) -> copy to device-local dst.
+                d3d11vk::VulkanBuffer staging{};
+                if (d3d11vk::backend().create_buffer(
+                        pDesc->ByteWidth,
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &staging)) {
+                    void* s = d3d11vk::backend().map_buffer(&staging);
+                    if (s) {
+                        std::memcpy(s, pInitialData, pDesc->ByteWidth);
+                        d3d11vk::backend().unmap_buffer(&staging);
+                        d3d11vk::backend().copy_buffer(staging.buffer, vk_buf.buffer,
+                                                       pDesc->ByteWidth);
+                    }
+                    d3d11vk::backend().destroy_buffer(&staging);
+                }
             }
         }
 
@@ -1596,24 +1662,58 @@ public:
                                       void*, ID3D11VertexShader** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_INFO("CreateVertexShader called with %zu bytes of DXBC (using stub SPIR-V)",
-                   static_cast<size_t>(BytecodeLength));
+
+        VkShaderModule module = VK_NULL_HANDLE;
+        bool usedStub = false;
+
+        if (pShaderBytecode && BytecodeLength > 0) {
+            std::vector<uint32_t> spirv;
+            if (g_shaderCache.getOrTranslate(
+                    static_cast<const uint8_t*>(pShaderBytecode),
+                    BytecodeLength, true, spirv)) {
+                VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                ci.codeSize = spirv.size() * sizeof(uint32_t);
+                ci.pCode = spirv.data();
+                if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
+                                         &module) == VK_SUCCESS) {
+                    D3D11_INFO("CreateVertexShader: translated DXBC (%zu bytes -> %zu SPIR-V words)",
+                               BytecodeLength, spirv.size());
+                } else {
+                    D3D11_INFO("CreateVertexShader: translation OK but vkCreateShaderModule failed, using stub");
+                    usedStub = true;
+                }
+            } else {
+                D3D11_INFO("CreateVertexShader: DXBC translation failed, using stub");
+                usedStub = true;
+            }
+        } else {
+            usedStub = true;
+        }
+
+        if (usedStub || module == VK_NULL_HANDLE) {
+            auto* shader = new MockD3D11VertexShader();
+            shader->device = this;
+
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = sizeof(d3d11vk::kStubVertexShaderSpv);
+            ci.pCode = d3d11vk::kStubVertexShaderSpv;
+            if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
+                                     &shader->module) != VK_SUCCESS) {
+                delete shader;
+                return E_FAIL_;
+            }
+            *pp = static_cast<ID3D11VertexShader*>(shader);
+            D3D11_INFO("Created stub VkShaderModule %p for ID3D11VertexShader %p",
+                       static_cast<void*>(shader->module), static_cast<void*>(shader));
+            return S_OK_;
+        }
 
         auto* shader = new MockD3D11VertexShader();
         shader->device = this;
-
-        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = sizeof(d3d11vk::kStubVertexShaderSpv);
-        ci.pCode = d3d11vk::kStubVertexShaderSpv;
-        if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
-                                 &shader->module) != VK_SUCCESS) {
-            delete shader;
-            return E_FAIL_;
-        }
-
+        shader->module = module;
         *pp = static_cast<ID3D11VertexShader*>(shader);
-        D3D11_INFO("Created stub VkShaderModule %p for ID3D11VertexShader %p",
-                   static_cast<void*>(shader->module), static_cast<void*>(shader));
+        D3D11_INFO("Created translated VkShaderModule %p for ID3D11VertexShader %p",
+                   static_cast<void*>(module), static_cast<void*>(shader));
         return S_OK_;
     }
 
@@ -1622,24 +1722,59 @@ public:
                                      void*, ID3D11PixelShader** pp) override {
         if (!pp) return E_POINTER_;
         *pp = nullptr;
-        D3D11_INFO("CreatePixelShader called with %zu bytes of DXBC (using stub SPIR-V)",
-                   static_cast<size_t>(BytecodeLength));
+
+        VkShaderModule module = VK_NULL_HANDLE;
+        bool usedStub = false;
+
+        if (pShaderBytecode && BytecodeLength > 0) {
+            std::vector<uint32_t> spirv;
+            if (g_shaderCache.getOrTranslate(
+                    static_cast<const uint8_t*>(pShaderBytecode),
+                    BytecodeLength, false, spirv)) {
+                VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                ci.codeSize = spirv.size() * sizeof(uint32_t);
+                ci.pCode = spirv.data();
+                if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
+                                         &module) == VK_SUCCESS) {
+                    D3D11_INFO("CreatePixelShader: translated DXBC (%zu bytes -> %zu SPIR-V words)",
+                               BytecodeLength, spirv.size());
+                } else {
+                    D3D11_INFO("CreatePixelShader: translation OK but vkCreateShaderModule failed, using stub");
+                    usedStub = true;
+                }
+            } else {
+                D3D11_INFO("CreatePixelShader: DXBC translation failed, using stub");
+                usedStub = true;
+            }
+        } else {
+            usedStub = true;
+        }
+
+        if (usedStub || module == VK_NULL_HANDLE) {
+            auto* shader = new MockD3D11PixelShader();
+            shader->device = this;
+
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = sizeof(d3d11vk::kStubPixelShaderSpv);
+            ci.pCode = d3d11vk::kStubPixelShaderSpv;
+            if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
+                                     &shader->module) != VK_SUCCESS) {
+                delete shader;
+                return E_FAIL_;
+            }
+
+            *pp = static_cast<ID3D11PixelShader*>(shader);
+            D3D11_INFO("Created stub VkShaderModule %p for ID3D11PixelShader %p",
+                       static_cast<void*>(shader->module), static_cast<void*>(shader));
+            return S_OK_;
+        }
 
         auto* shader = new MockD3D11PixelShader();
         shader->device = this;
-
-        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = sizeof(d3d11vk::kStubPixelShaderSpv);
-        ci.pCode = d3d11vk::kStubPixelShaderSpv;
-        if (vkCreateShaderModule(d3d11vk::backend().device(), &ci, nullptr,
-                                 &shader->module) != VK_SUCCESS) {
-            delete shader;
-            return E_FAIL_;
-        }
-
+        shader->module = module;
         *pp = static_cast<ID3D11PixelShader*>(shader);
-        D3D11_INFO("Created stub VkShaderModule %p for ID3D11PixelShader %p",
-                   static_cast<void*>(shader->module), static_cast<void*>(shader));
+        D3D11_INFO("Created translated VkShaderModule %p for ID3D11PixelShader %p",
+                   static_cast<void*>(module), static_cast<void*>(shader));
         return S_OK_;
     }
 
@@ -1912,26 +2047,34 @@ bool MockD3D11DeviceContext::ensure_descriptor_set() {
     VkDevice dev = vk.device();
     if (!dev) return false;
 
-    // Descriptor set layout: set 0, binding 0, combined image sampler, FRAGMENT.
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0;
-    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1;
-    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Descriptor set layout: set 0, binding 0 = UBO (VS), binding 1 = sampler2D (PS).
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = 1;
-    dslci.pBindings = &b;
+    dslci.bindingCount = 2;
+    dslci.pBindings = bindings;
     VK_CHECK_D3D11(vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dset_layout_));
 
-    // Descriptor pool (one set).
-    VkDescriptorPoolSize pool_size{};
-    pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_size.descriptorCount = 1;
+    // Descriptor pool: one UBO + one sampler, one set. Generous maxSets for
+    // future growth (game may bind different CBs each frame).
+    VkDescriptorPoolSize pool_sizes[2]{};
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    pool_sizes[0].descriptorCount = 4;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pool_sizes[1].descriptorCount = 4;
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci.maxSets = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &pool_size;
+    dpci.maxSets = 4;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = pool_sizes;
     VK_CHECK_D3D11(vkCreateDescriptorPool(dev, &dpci, nullptr, &dset_pool_));
 
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1940,7 +2083,7 @@ bool MockD3D11DeviceContext::ensure_descriptor_set() {
     dsai.pSetLayouts = &dset_layout_;
     VK_CHECK_D3D11(vkAllocateDescriptorSets(dev, &dsai, &dset_));
 
-    D3D11_INFO("Created descriptor set layout/pool/set (set=0, binding=0, sampler)");
+    D3D11_INFO("Created descriptor set layout/pool/set (set=0, binding=0 UBO, binding=1 sampler)");
     return true;
 }
 
@@ -2087,13 +2230,14 @@ bool MockD3D11DeviceContext::ensure_pipeline() {
 void MockD3D11DeviceContext::Draw(UINT VertexCount, UINT StartVertexLocation) {
     D3D11_INFO("Draw(%u, %u) -> pending", VertexCount, StartVertexLocation);
     draw_count_++;
-    pending_draws_.push_back({VertexCount, StartVertexLocation});
+    pending_draws_.push_back({false, VertexCount, StartVertexLocation, 0, 1});
 }
 
 void MockD3D11DeviceContext::DrawIndexed(UINT IndexCount, UINT StartIndexLocation,
                                          INT BaseVertexLocation) {
     D3D11_INFO("DrawIndexed(%u, %u, %d)", IndexCount, StartIndexLocation, BaseVertexLocation);
-    Draw(IndexCount, 0);
+    draw_count_++;
+    pending_draws_.push_back({true, IndexCount, StartIndexLocation, BaseVertexLocation, 1});
 }
 
 // --------------------------------------------------------------------------
@@ -2120,29 +2264,56 @@ bool MockD3D11DeviceContext::execute_frame() {
     VkCommandBuffer cmd = vk.begin_one_shot();
     if (!cmd) return false;
 
-    // Update the descriptor set with the bound SRV + sampler (or defaults).
+    // Update the descriptor set: binding 0 = UBO (from vs_cb_[0]),
+    // binding 1 = combined image sampler (from ps_srv_/ps_sampler_).
     if (dset_) {
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        if (ps_srv_) view = ps_srv_->view();
-        if (ps_sampler_) sampler = ps_sampler_->sampler();
-        if (view && sampler) {
-            VkDescriptorImageInfo image_info{};
-            image_info.imageView = view;
+        VkWriteDescriptorSet writes[2]{};
+        VkDescriptorBufferInfo buf_info{};
+        VkDescriptorImageInfo image_info{};
+        UINT write_count = 0;
+
+        // Binding 0: uniform buffer (mat4 for VS).
+        ID3D11Buffer* cb = vs_cb_[0];
+        if (cb) {
+            auto* cbuf = static_cast<MockD3D11Buffer*>(cb);
+            VkBuffer vk_buf = cbuf->vk().buffer;
+            if (vk_buf) {
+                buf_info.buffer = vk_buf;
+                buf_info.offset = 0;
+                buf_info.range = cbuf->desc().ByteWidth;
+                writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[write_count].dstSet = dset_;
+                writes[write_count].dstBinding = 0;
+                writes[write_count].descriptorCount = 1;
+                writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                writes[write_count].pBufferInfo = &buf_info;
+                ++write_count;
+                D3D11_INFO("Updated descriptor set binding 0 (UBO %p, %u bytes)",
+                           static_cast<void*>(vk_buf), cbuf->desc().ByteWidth);
+            }
+        }
+
+        // Binding 1: sampler2D.
+        if (ps_srv_ && ps_sampler_) {
+            image_info.imageView = ps_srv_->view();
             image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            image_info.sampler = sampler;
-            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            write.dstSet = dset_;
-            write.dstBinding = 0;
-            write.dstArrayElement = 0;
-            write.descriptorCount = 1;
-            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            write.pImageInfo = &image_info;
-            vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
-            D3D11_INFO("Updated descriptor set 0 binding 0 (view=%p sampler=%p)",
-                       static_cast<void*>(view), static_cast<void*>(sampler));
+            image_info.sampler = ps_sampler_->sampler();
+            writes[write_count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[write_count].dstSet = dset_;
+            writes[write_count].dstBinding = 1;
+            writes[write_count].descriptorCount = 1;
+            writes[write_count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[write_count].pImageInfo = &image_info;
+            ++write_count;
+            D3D11_INFO("Updated descriptor set binding 1 (view=%p sampler=%p)",
+                       static_cast<void*>(image_info.imageView),
+                       static_cast<void*>(image_info.sampler));
+        }
+
+        if (write_count) {
+            vkUpdateDescriptorSets(dev, write_count, writes, 0, nullptr);
         } else {
-            D3D11_INFO("execute_frame: no SRV+sampler bound; descriptor set not updated");
+            D3D11_INFO("execute_frame: no CB+SRV+sampler bound; descriptor not updated");
         }
     }
 
@@ -2184,9 +2355,24 @@ bool MockD3D11DeviceContext::execute_frame() {
         vkCmdBindVertexBuffers(cmd, 0, 1, &vk_buf, &offset);
     }
 
+    // Bind index buffer if present (Phase 5).
+    if (ia_index_buffer_) {
+        auto* ibuf = static_cast<MockD3D11Buffer*>(ia_index_buffer_);
+        VkBuffer vk_ibuf = ibuf->vk().buffer;
+        VkIndexType itype = (ia_index_format_ == DXGI_FORMAT_R16_UINT_)
+                                ? VK_INDEX_TYPE_UINT16
+                                : VK_INDEX_TYPE_UINT32;
+        vkCmdBindIndexBuffer(cmd, vk_ibuf, ia_index_offset_, itype);
+    }
+
     // Execute pending draws.
     for (const auto& d : pending_draws_) {
-        vkCmdDraw(cmd, d.vertex_count, 1, d.start_vertex, 0);
+        if (d.indexed && ia_index_buffer_) {
+            vkCmdDrawIndexed(cmd, d.vertex_count, d.instance_count,
+                             d.start_vertex, d.base_vertex, 0);
+        } else {
+            vkCmdDraw(cmd, d.vertex_count, d.instance_count, d.start_vertex, 0);
+        }
     }
     pending_draws_.clear();
 

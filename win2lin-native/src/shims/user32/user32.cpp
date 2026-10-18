@@ -19,6 +19,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -389,7 +390,12 @@ WIN2LIN_EXPORT BOOL WINAPI DestroyWindow(HWND hwnd) {
     if (it == g_windows.end()) return 0;
     if (it->second.sdl_window) {
         SDL_Window* w = static_cast<SDL_Window*>(it->second.sdl_window);
+        auto t0 = std::chrono::steady_clock::now();
         SDL_DestroyWindow(w);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        USER32_INFO("SDL_DestroyWindow took %lld ms", static_cast<long long>(ms));
     }
     g_windows.erase(it);
     return 1;

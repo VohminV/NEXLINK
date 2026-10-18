@@ -5,6 +5,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,20 +37,33 @@ namespace {
 } // namespace
 
 VulkanBackend::~VulkanBackend() {
+    auto mark = [t0 = std::chrono::steady_clock::now()](const char* what) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        fprintf(stderr, "[d3d11-dtor-timing] %6lld ms %s\n",
+                static_cast<long long>(ms), what);
+    };
+    mark("dtor-start");
     if (device_) {
         vkDeviceWaitIdle(device_);
+        mark("wait-idle");
         destroy_swapchain();
+        mark("swapchain-destroyed");
         destroy_render_target();
         if (framebuffer_) vkDestroyFramebuffer(device_, framebuffer_, nullptr);
         if (render_pass_) vkDestroyRenderPass(device_, render_pass_, nullptr);
         if (swapchain_render_pass_)
             vkDestroyRenderPass(device_, swapchain_render_pass_, nullptr);
         if (cmd_pool_) vkDestroyCommandPool(device_, cmd_pool_, nullptr);
+        mark("resources-destroyed");
         vkDestroyDevice(device_, nullptr);
+        mark("device-destroyed");
     }
     if (swapchain_.surface) vkDestroySurfaceKHR(instance_, swapchain_.surface, nullptr);
     if (headless_surface_) vkDestroySurfaceKHR(instance_, headless_surface_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
+    mark("instance-destroyed");
 }
 
 bool VulkanBackend::init() {
@@ -298,8 +312,7 @@ bool VulkanBackend::create_device(const std::vector<const char*>& dev_exts) {
 
     VK_CHECK(vkCreateDevice(physical_device_, &dci, nullptr, &device_));
     vkGetDeviceQueue(device_, graphics_queue_family_, 0, &graphics_queue_);
-    vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
-    return true;
+    vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);    return true;
 }
 
 uint32_t VulkanBackend::find_memory_type(uint32_t type_bits,
@@ -388,8 +401,26 @@ void* VulkanBackend::map_buffer(VulkanBuffer* buf) {
 
 void VulkanBackend::unmap_buffer(VulkanBuffer* buf) {
     if (!buf || !buf->mapped) return;
+    // Flush so the GPU sees the updated data even if memory is non-coherent.
+    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    range.memory = buf->memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    vkFlushMappedMemoryRanges(device_, 1, &range);
     vkUnmapMemory(device_, buf->memory);
     buf->mapped = nullptr;
+}
+
+void VulkanBackend::copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) {
+    if (!src || !dst || size == 0) return;
+    VkCommandBuffer cmd = begin_one_shot();
+    if (!cmd) return;
+    VkBufferCopy region{};
+    region.srcOffset = 0;
+    region.dstOffset = 0;
+    region.size = size;
+    vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+    end_one_shot(cmd); // submits + waits idle + frees (one-shot copy)
 }
 
 VkCommandBuffer VulkanBackend::begin_one_shot() {
@@ -595,18 +626,37 @@ bool VulkanBackend::create_swapchain_objects(uint32_t width, uint32_t height) {
     return true;
 }
 
+void VulkanBackend::shutdown_swapchain() {
+    if (!device_ || !swapchain_.handle) return;
+    vkDeviceWaitIdle(device_);
+    // TEMP-DRAIN: bounded delay (replicates fixture Sleep(50) experiment)
+    SDL_Delay(50);
+    destroy_swapchain();
+}
+
 void VulkanBackend::destroy_swapchain() {
     if (!device_) return;
+    auto mark = [t0 = std::chrono::steady_clock::now()](const char* what) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        fprintf(stderr, "[d3d11-dtor-timing] %6lld ms   destroy_swapchain: %s\n",
+                static_cast<long long>(ms), what);
+    };
+    mark("start");
     if (swapchain_.in_flight) vkDestroyFence(device_, swapchain_.in_flight, nullptr);
     if (swapchain_.image_available)
         vkDestroySemaphore(device_, swapchain_.image_available, nullptr);
     if (swapchain_.render_finished)
         vkDestroySemaphore(device_, swapchain_.render_finished, nullptr);
+    mark("sync-objects");
     for (auto fb : swapchain_.framebuffers)
         if (fb) vkDestroyFramebuffer(device_, fb, nullptr);
     for (auto v : swapchain_.views)
         if (v) vkDestroyImageView(device_, v, nullptr);
+    mark("views-framebuffers");
     if (swapchain_.handle) vkDestroySwapchainKHR(device_, swapchain_.handle, nullptr);
+    mark("swapchain-handle");
     swapchain_ = {};
 }
 

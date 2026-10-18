@@ -217,17 +217,22 @@ int main() {
           "CreateInputLayout returned S_OK");
     check(r.out.find("CreateRasterizerState -> hr=0x00000000") != std::string::npos,
           "CreateRasterizerState returned S_OK");
-    check(r.out.find("CreateBuffer -> hr=0x00000000") != std::string::npos,
-          "CreateBuffer returned S_OK");
-    check(r.out.find("Map -> hr=0x00000000") != std::string::npos,
-          "Map returned S_OK");
-    check(r.out.find("Unmap OK") != std::string::npos, "Unmap succeeded");
+    check(r.out.find("CreateBuffer(vertex) -> hr=0x00000000") != std::string::npos,
+          "CreateBuffer(vertex) returned S_OK");
+    check(r.out.find("CreateBuffer(index) -> hr=0x00000000") != std::string::npos,
+          "CreateBuffer(index) returned S_OK");
+    check(r.out.find("CreateBuffer(constant) -> hr=0x00000000") != std::string::npos,
+          "CreateBuffer(constant) returned S_OK");
+    check(r.out.find("Map(constant buffer) OK, MVP updated") != std::string::npos,
+          "Map(constant buffer) succeeded and MVP updated");
     check(r.out.find("PSSetShaderResources OK") != std::string::npos,
           "PSSetShaderResources executed");
     check(r.out.find("PSSetSamplers OK") != std::string::npos,
           "PSSetSamplers executed");
-    check(r.out.find("Draw(3, 0) returned") != std::string::npos,
-          "Draw(3, 0) executed without crash");
+    check(r.out.find("VSSetConstantBuffers OK") != std::string::npos,
+          "VSSetConstantBuffers executed");
+    check(r.out.find("DrawIndexed(36, 0, 0) returned") != std::string::npos,
+          "DrawIndexed(36, 0, 0) executed without crash");
     check(r.out.find("Presenting for 3 seconds") != std::string::npos,
           "fixture started 3-second present loop");
     check(r.out.find("Presented") != std::string::npos && r.out.find("frames in 3 seconds") != std::string::npos,

@@ -98,6 +98,7 @@ public:
     void destroy_buffer(VulkanBuffer* buf);
     void* map_buffer(VulkanBuffer* buf);
     void unmap_buffer(VulkanBuffer* buf);
+    void copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size);
 
     // ---- Offscreen render target (headless swap chain substitute) ----------
     bool create_render_target(uint32_t width, uint32_t height, VkFormat format);
@@ -107,6 +108,12 @@ public:
     // ---- Swapchain accessors ------------------------------------------------
     VulkanSwapchain& swapchain() { return swapchain_; }
     const VulkanSwapchain& swapchain() const { return swapchain_; }
+
+    // Wait for the GPU, then destroy the swapchain while the presenting
+    // window is still alive (called from the DXGI swapchain destructor).
+    // Destroying the window first leaves in-flight presents that make both
+    // SDL_DestroyWindow() and vkDestroySwapchainKHR() stall for seconds.
+    void shutdown_swapchain();
 
     // Acquire the next swapchain image (waits on in_flight fence).
     bool acquire_next_image();

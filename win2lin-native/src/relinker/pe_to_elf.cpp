@@ -100,6 +100,21 @@ std::string normalize_dll_stem(const std::string& stem) {
     if (stem.rfind("api-ms-win-core-", 0) == 0 || stem.rfind("api-ms-win-dev-", 0) == 0) {
         return "kernel32";
     }
+    if (stem.rfind("api-ms-win-security-", 0) == 0 || stem == "advapi32") {
+        return "advapi32";
+    }
+    if (stem == "ws2_32" || stem == "wsock32") return "ws2_32";
+    if (stem == "winmm") return "winmm";
+    if (stem.rfind("dinput", 0) == 0) return "dinput8";
+    if (stem == "dsound") return "dsound";
+    if (stem == "version") return "version";
+    if (stem == "shell32") return "shell32";
+    if (stem == "shlwapi") return "shlwapi";
+    if (stem == "ole32") return "ole32";
+    if (stem == "oleaut32") return "oleaut32";
+    if (stem == "d3d9" || stem.rfind("d3dx9", 0) == 0 || stem.rfind("d3dcompiler", 0) == 0) {
+        return "d3d9";
+    }
     return stem;
 }
 
